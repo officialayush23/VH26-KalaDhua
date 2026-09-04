@@ -41,3 +41,12 @@ drop policy if exists aura_audit_log_read on public.aura_audit_log;
 create policy aura_audit_log_read
     on public.aura_audit_log for select
     using (true);
+
+-- `aura_events.kind` is a foreign key onto a lookup table, so an event kind that is not
+-- listed there is rejected with a 409 rather than inserted. That is the right design -- it
+-- stops a typo becoming a new category nobody ever queries -- but it means every new kind
+-- has to be declared. These are the ones the engine now emits.
+insert into public.aura_event_kinds (code) values
+    ('engine_started'), ('Invalidate'), ('VersionBump'), ('ModelReload'),
+    ('PolicyShift'), ('ScaleUp'), ('ScaleDown'), ('AttackStart'), ('SimStart')
+on conflict (code) do nothing;

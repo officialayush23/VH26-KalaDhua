@@ -231,7 +231,12 @@ async fn main() -> anyhow::Result<()> {
             });
             if let Some(sb) = announce.supabase.as_ref() {
                 if let Err(e) = sb.push_event("engine_started", detail).await {
-                    tracing::warn!("startup event not recorded: {e}");
+                    // aura_events.kind is a foreign key onto a lookup table, so an
+                    // undeclared kind is refused rather than inserted.
+                    tracing::warn!(
+                        "startup event not recorded ({e}); if this is a 409, run \
+                         training/sql/006_audit_log.sql to declare the new event kinds"
+                    );
                 }
             }
         });
@@ -1417,6 +1422,7 @@ async fn ship_audit(app: Shared) {
         None => return,
     };
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    let mut failures: u32 = 0;
     loop {
         ticker.tick().await;
         let batch = app.engine.lock().audit.drain_unshipped(200);
@@ -1429,9 +1435,26 @@ async fn ship_audit(app: Shared) {
             .collect();
         if let Err(e) = sb.push_audit(&payload).await {
             app.engine.lock().audit.requeue(batch);
-            tracing::warn!("audit not shipped, re-queued: {e}");
+            let text = e.to_string();
+            // A missing table is not a transient failure and will never fix itself. Saying
+            // so once and stopping is far more useful than the same line every ten seconds
+            // for the rest of the run, which is noise a person learns to scroll past.
+            if text.contains("PGRST205") || text.contains("Could not find the table") {
+                tracing::warn!(
+                    "audit shipping disabled: the aura_audit_log table does not exist. \
+                     Run training/sql/006_audit_log.sql against the project. The in-memory \
+                     log at GET /v1/audit keeps working either way."
+                );
+                return;
+            }
+            failures += 1;
+            if failures % 6 == 1 {
+                tracing::warn!("audit not shipped, re-queued: {e}");
+            }
             // Back off rather than hammering a project that is refusing writes.
             tokio::time::sleep(Duration::from_secs(10)).await;
+        } else {
+            failures = 0;
         }
     }
 }
