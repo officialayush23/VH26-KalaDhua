@@ -69,7 +69,14 @@ pub struct Normalization {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearWeights {
+    /// The trainer writes `intercept`; this reader has always asked for `bias`, which is
+    /// why every linear bundle in the control plane failed to parse while the GBDT ones
+    /// loaded. Both names are accepted: they are the same number, and renaming one side
+    /// would strand the bundles already published.
+    #[serde(alias = "intercept")]
     pub bias: f64,
+    /// Same story: the trainer calls the coefficient vector `coef`.
+    #[serde(alias = "coef")]
     pub weights: Vec<f64>,
 }
 

@@ -107,14 +107,22 @@ impl CapacityController {
         // "it is not full" mean "it is too big".
         let warm = engine.requests >= 5_000;
         let evictions_seen = engine.store.evictions > 0;
-        let host_available = cfg
+        // Headroom is the smaller of what the operator budgeted and what the machine will
+        // actually give us. Only the first of those used to be consulted, which is how a
+        // pool grows past the point where the allocator can satisfy it.
+        let budget_headroom = cfg
             .capacity
             .host_budget_bytes
             .saturating_sub(engine.store.used_bytes());
+        let machine_headroom = match crate::hostmem::safe_pool_bytes() {
+            Some(safe) => safe.saturating_sub(engine.store.used_bytes()),
+            None => budget_headroom,
+        };
+        let host_available = budget_headroom.min(machine_headroom);
 
         let (decision, reason) = if self.manual {
             ("Hold".to_string(), "capacity is under manual control".to_string())
-        } else if roi >= cfg.capacity.roi_threshold && next > cur && host_available > step {
+        } else if roi >= cfg.capacity.roi_threshold && next > cur && host_available > step * 2 {
             (
                 "ScaleUp".to_string(),
                 format!(
@@ -126,7 +134,10 @@ impl CapacityController {
         } else if roi >= cfg.capacity.roi_threshold && host_available <= step {
             (
                 "ScaleOut".to_string(),
-                "more memory pays for itself but this host has none left".to_string(),
+                format!(
+                    "more memory pays for itself, but this host has only {} it can spare",
+                    human_bytes(host_available)
+                ),
             )
         } else if pressure < 0.55 && cur > cfg.capacity.min_bytes && evictions_seen && warm {
             (

@@ -30,4 +30,7 @@ base64 = "0.22"
 # neither pulls a date or crypto framework in behind it.
 sha2 = "0.10"
 hmac = "0.12"
+# Real host memory. Without it the capacity controller reasons about a config constant and
+# will happily grow a pool that the machine cannot allocate.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

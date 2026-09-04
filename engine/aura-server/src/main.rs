@@ -7,6 +7,7 @@ mod capacity;
 mod consistency;
 mod engine;
 mod feedback;
+mod hostmem;
 mod policy;
 mod predictor;
 mod profiles;
@@ -86,6 +87,10 @@ struct Args {
     /// serves what applications put into it.
     #[arg(long)]
     scenario: Option<String>,
+    /// Pool size in megabytes, overriding the config file. Convenient because the number
+    /// that matters on a laptop is different from the one that matters on a server.
+    #[arg(long)]
+    pool_mb: Option<u64>,
 }
 
 struct Sim {
@@ -180,7 +185,58 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = supabase::load_dotenv() {
         tracing::info!(env = %path.display(), "loaded environment file");
     }
-    let cfg = Config::load(args.config.as_deref());
+    let mut cfg = Config::load(args.config.as_deref());
+
+    if let Some(mb) = args.pool_mb {
+        // An explicit pool size is a ceiling as well as a starting point. The controller is
+        // free to grow within the config's own bounds, but not past a number a person typed
+        // on the command line because their machine has that much and no more.
+        let bytes = mb.saturating_mul(1024 * 1024).max(8 * 1024 * 1024);
+        cfg.cache.capacity_bytes = bytes;
+        cfg.capacity.max_bytes = cfg.capacity.max_bytes.min(bytes);
+        cfg.capacity.host_budget_bytes = cfg.capacity.host_budget_bytes.min(bytes);
+        cfg.capacity.min_bytes = cfg.capacity.min_bytes.min(bytes);
+    }
+
+    // With --real-values the pool is resident memory, so a configured size larger than the
+    // machine is not a budget, it is a crash: the allocator refuses and a binary built with
+    // panic=abort does not get to explain itself. Clamp to what this host can actually
+    // spare, and say so, rather than starting and dying under load.
+    if args.real_values {
+        let (available, total) = hostmem::snapshot();
+        if let Some(safe) = hostmem::safe_pool_bytes() {
+            if cfg.cache.capacity_bytes > safe {
+                tracing::warn!(
+                    configured = %aura_server_bytes(cfg.cache.capacity_bytes),
+                    allowed = %aura_server_bytes(safe),
+                    available = %aura_server_bytes(available),
+                    total = %aura_server_bytes(total),
+                    "pool clamped to what this machine can hold: --real-values stores payloads \
+                     for real, and the measured overhead is about 1.5x the logical pool"
+                );
+                cfg.cache.capacity_bytes = safe;
+            }
+            // The controller must not undo the clamp on the next tick.
+            if cfg.capacity.max_bytes > safe {
+                cfg.capacity.max_bytes = safe;
+            }
+            if cfg.capacity.host_budget_bytes > safe {
+                cfg.capacity.host_budget_bytes = safe;
+            }
+            if cfg.capacity.min_bytes > cfg.cache.capacity_bytes {
+                cfg.capacity.min_bytes = cfg.cache.capacity_bytes;
+            }
+            if cfg.capacity.step_bytes > cfg.cache.capacity_bytes / 2 {
+                cfg.capacity.step_bytes = (cfg.cache.capacity_bytes / 4).max(8 * 1024 * 1024);
+            }
+        } else {
+            tracing::warn!(
+                "this platform will not report free memory; the pool is bounded only by the \
+                 config file. Set --pool-mb explicitly if the machine is small"
+            );
+        }
+    }
+    let cfg = cfg;
 
     let sb = supabase::Supabase::from_env();
     match &sb {
@@ -514,6 +570,10 @@ fn build_frame(app: &Shared) -> Value {
             "burn_rate_usd_per_hour": round2(total / elapsed_h)
         },
         "capacity": report,
+        "host": {
+            "available_bytes": hostmem::snapshot().0,
+            "total_bytes": hostmem::snapshot().1
+        },
         "workload": {
             "regime": eng.regime.as_str(),
             "confidence": round4(eng.regime_confidence),
@@ -596,6 +656,21 @@ fn build_frame(app: &Shared) -> Value {
         "audit": eng.audit.recent(24),
         "recent_decisions": eng.explains.iter().rev().take(12).collect::<Vec<_>>()
     })
+}
+
+/// Bytes as a person writes them, for the boot-time log lines. The engine has its own
+/// formatter for telemetry; this one exists so startup does not depend on the engine being
+/// constructed yet.
+fn aura_server_bytes(n: u64) -> String {
+    let n = n as f64;
+    const KB: f64 = 1024.0;
+    if n < KB * KB {
+        format!("{:.0} KB", n / KB)
+    } else if n < KB * KB * KB {
+        format!("{:.0} MB", n / (KB * KB))
+    } else {
+        format!("{:.2} GB", n / (KB * KB * KB))
+    }
 }
 
 fn cost_profile(app: &str) -> &'static str {
