@@ -47,7 +47,7 @@ export function Panel({ title, subtitle, actions, footer, className, children })
     <section
       ref={ref}
       className={cn(
-        "flex flex-col rounded-2xl border border-border/70 bg-card/50 shadow-sm backdrop-blur",
+        "flex min-w-0 flex-col rounded-2xl border border-border bg-card shadow-sm",
         className
       )}
     >

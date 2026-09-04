@@ -257,7 +257,7 @@ export function PolicyPanel({ frame }) {
       />
 
       {leader && (
-        <p className="mt-3 rounded-lg border border-border/60 bg-background/40 px-3 py-2 text-[12.5px] leading-snug">
+        <p className="mt-3 rounded-lg border border-border/60 bg-background px-3 py-2 text-[12.5px] leading-snug">
           <span className="font-medium">Leaning on {leader[0]}</span>{" "}
           <span className="text-muted-foreground">
             ({pct(leader[1], 0)} of the blend) — {POLICY_MEANING[leader[0]]}.
@@ -610,8 +610,49 @@ export function Controls({ frame, send, status }) {
                 {s}x
               </Button>
             ))}
-            <Button size="sm" variant="secondary" className="ml-1" onClick={() => post("/v1/sim/stop")}>
-              Pause
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-1">
+          <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+            Traffic
+          </label>
+          <div className="flex items-center gap-1.5">
+            <Button
+              size="sm"
+              variant={sim.running ? "outline" : "default"}
+              disabled={status === "offline" || sim.running}
+              onClick={() =>
+                post("/v1/sim/start", {
+                  scenario: sim.scenario && sim.scenario !== "none" ? sim.scenario : "mixed_production",
+                  speed: sim.speed ?? 1,
+                })
+              }
+            >
+              Start
+            </Button>
+            <Button
+              size="sm"
+              variant={sim.running ? "secondary" : "outline"}
+              disabled={status === "offline" || !sim.running}
+              onClick={() => post("/v1/sim/stop")}
+            >
+              Stop
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={status === "offline"}
+              title="Restart this scenario from zero with a fresh seed"
+              onClick={() =>
+                post("/v1/sim/start", {
+                  scenario: sim.scenario && sim.scenario !== "none" ? sim.scenario : "mixed_production",
+                  speed: sim.speed ?? 1,
+                  seed: Math.floor(Math.random() * 100000),
+                })
+              }
+            >
+              Restart
             </Button>
           </div>
         </div>
@@ -820,5 +861,91 @@ function Row({ label, value }) {
       <span className="text-muted-foreground">{label}</span>
       <span className="text-right font-mono text-[12px]">{value}</span>
     </div>
+  )
+}
+
+
+/// Answers "where is the model and where does it plug in". Until a bundle is published
+/// the engine runs on a logistic model it trains online, which is why the dashboard works
+/// on a fresh clone with nothing trained.
+export function ModelPanel({ frame }) {
+  const policy = frame?.policy ?? {}
+  const engine = frame?.engine ?? {}
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState(null)
+
+  const kind = policy.predictor ?? "unknown"
+  const trained = kind === "gbdt" || kind === "linear"
+
+  const reload = async (source) => {
+    setBusy(true)
+    try {
+      setResult(await post("/v1/model/reload", source === "supabase" ? { source } : { path: "models" }))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Panel
+      title="The reuse model"
+      subtitle="Predicts whether a key will be asked for again at 10 s, 60 s and 600 s. That prediction is one input to the value calculation, never the whole decision."
+      actions={<Pill tone={trained ? "good" : "warn"}>{trained ? kind : "untrained"}</Pill>}
+      footer={
+        trained
+          ? "Loaded. Predictions now come from the trained bundle."
+          : "No bundle published yet. The engine is using the logistic model it trains online, which is a working fallback, not a failure."
+      }
+    >
+      <div className="grid grid-cols-2 gap-3">
+        <Metric label="Predictor in use" value={kind} size="sm"
+          explain={trained ? "loaded from a published bundle" : "learns online from realised outcomes"} />
+        <Metric label="Confidence" value={pct(policy.predictor_confidence ?? 0, 0)} size="sm"
+          explain="how much weight the engine gives it" />
+        <Metric label="Predictions made" value={Number(engine.inference_calls ?? 0).toLocaleString()} size="sm"
+          explain="write path only, never on a read" />
+        <Metric label="Influence on decisions" value={pct(policy.ml_influence ?? 0, 0)} size="sm"
+          explain="the rest is the classical policy blend" />
+      </div>
+
+      <ol className="mt-4 space-y-2 text-[12.5px]">
+        <Step n="1" title="Train it in Colab"
+          body="Open training/notebooks/aura_training_colab.ipynb, add your two Supabase secrets, run every cell." />
+        <Step n="2" title="It uploads itself"
+          body="The notebook writes model_bundle.json to Supabase Storage and registers the row in aura_models with is_active set." />
+        <Step n="3" title="Plug it in"
+          body="Press the button below, or drop the exported .json files into engine/models/ and restart. No rebuild needed either way." />
+      </ol>
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button size="sm" onClick={() => reload("supabase")} disabled={busy}>
+          {busy ? "Loading…" : "Load from Supabase"}
+        </Button>
+        <Button size="sm" variant="outline" onClick={() => reload("file")} disabled={busy}>
+          Load from engine/models
+        </Button>
+      </div>
+      {result && (
+        <p className={cn("mt-2 text-[12px]", result.ok ? "text-primary" : "text-rose-400")}>
+          {result.ok
+            ? `Loaded ${result.kind}${result.horizons?.length ? ` (${result.horizons.join(", ")})` : ""}.`
+            : `Nothing loaded: ${result.error ?? "no bundle found"}.`}
+        </p>
+      )}
+    </Panel>
+  )
+}
+
+function Step({ n, title, body }) {
+  return (
+    <li className="flex gap-2.5">
+      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-muted font-mono text-[11px]">
+        {n}
+      </span>
+      <span>
+        <span className="font-medium">{title}</span>{" "}
+        <span className="text-muted-foreground">{body}</span>
+      </span>
+    </li>
   )
 }
