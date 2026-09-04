@@ -3,6 +3,9 @@ import { useCallback, useEffect, useRef, useState } from "react"
 const API = import.meta.env.VITE_AURA_URL || "http://localhost:8080"
 const WS = API.replace(/^http/, "ws")
 const HISTORY_LIMIT = 240
+// Scrollback the client keeps. The engine only ever sends the tail of its own log, so this
+// is what makes the console readable: the page accumulates, the socket stays small.
+const LOG_LIMIT = 500
 
 /// Subscribes to the engine's telemetry socket. Every frame is a complete snapshot, so a
 /// dropped frame costs nothing and there is no state to reconcile on reconnect. If the
@@ -14,12 +17,28 @@ export function useLiveFeed() {
   const [frame, setFrame] = useState(null)
   const [history, setHistory] = useState([])
   const [status, setStatus] = useState("connecting")
+  const [log, setLog] = useState([])
   const socketRef = useRef(null)
   const retryRef = useRef(null)
   const pollRef = useRef(null)
 
   const record = useCallback((next) => {
     setFrame(next)
+
+    // Audit entries arrive newest first and repeat across frames. `seq` is monotonic and
+    // unique, so merging on it means a slow tab, a dropped frame or a reconnect all end up
+    // with the same scrollback and never a duplicate line.
+    const incoming = next?.audit
+    if (Array.isArray(incoming) && incoming.length) {
+      setLog((prev) => {
+        const seen = new Set(prev.map((e) => e.seq))
+        const fresh = incoming.filter((e) => e && !seen.has(e.seq))
+        if (!fresh.length) return prev
+        const out = [...fresh, ...prev].sort((a, b) => b.seq - a.seq)
+        return out.length > LOG_LIMIT ? out.slice(0, LOG_LIMIT) : out
+      })
+    }
+
     setHistory((prev) => {
       const t = (next?.virtual_time_s ?? 0)
       const last = prev[prev.length - 1]
@@ -115,7 +134,7 @@ export function useLiveFeed() {
     return false
   }, [])
 
-  return { frame, history, status, send, api: API }
+  return { frame, history, status, send, log, api: API }
 }
 
 export async function post(path, body) {

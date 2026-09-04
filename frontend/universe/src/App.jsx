@@ -17,6 +17,7 @@ import {
   PolicyPanel,
   SupabasePanel,
 } from "@/components/dashboard/panels"
+import { ActivityLog } from "@/components/dashboard/activity"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
 import { FlowDiagram } from "@/components/dashboard/flowdiagram"
 
@@ -29,6 +30,7 @@ const STATUS = {
 }
 
 const TABS = [
+  { id: "live", label: "Live" },
   { id: "overview", label: "Overview" },
   { id: "flow", label: "Request flow" },
   { id: "decisions", label: "Decisions" },
@@ -37,8 +39,8 @@ const TABS = [
 ]
 
 export function App() {
-  const { frame, history, status, send } = useLiveFeed()
-  const [tab, setTab] = useState("overview")
+  const { frame, history, status, send, log } = useLiveFeed()
+  const [tab, setTab] = useState("live")
   const rootRef = useRef(null)
 
   // Animate the header once on mount only. Running a stagger across the whole page on
@@ -156,6 +158,27 @@ export function App() {
         </nav>
 
         <div ref={paneRef}>
+          {tab === "live" && (
+            <div className="space-y-4">
+              <Headline frame={frame} history={history} />
+              <div className="grid items-start gap-4 xl:grid-cols-3">
+                {/* The log is the page. Two thirds of the width and the full height of the
+                    viewport, because reading a cache's reasoning is the demonstration; the
+                    aggregates beside it are context for the sentence you are reading. */}
+                <ActivityLog
+                  log={log}
+                  status={status}
+                  className="h-[calc(100svh-330px)] min-h-[520px] xl:col-span-2"
+                />
+                <div className="space-y-4">
+                  <CapacityPanel frame={frame} />
+                  <ApplicationsPanel frame={frame} />
+                </div>
+              </div>
+              <Controls frame={frame} send={send} status={status} />
+            </div>
+          )}
+
           {tab === "overview" && (
             <div className="space-y-4">
               <Headline frame={frame} history={history} />
@@ -184,8 +207,9 @@ export function App() {
 
           {tab === "decisions" && (
             <div className="grid items-start gap-4 xl:grid-cols-3">
-              <div className="xl:col-span-2">
+              <div className="space-y-4 xl:col-span-2">
                 <DecisionFeed frame={frame} />
+                <ActivityLog log={log} status={status} className="h-[560px]" />
               </div>
               <div className="space-y-4">
                 <PolicyPanel frame={frame} />

@@ -560,6 +560,10 @@ fn build_frame(app: &Shared) -> Value {
         },
         "applications": apps,
         "events": eng.events.iter().rev().take(20).collect::<Vec<_>>(),
+        // The audit log rides the socket rather than being polled. Every entry carries a
+        // monotonic `seq`, so the client keeps its own scrollback and drops what it has
+        // already seen; a dropped frame costs nothing and a reconnect replays the tail.
+        "audit": eng.audit.recent(24),
         "recent_decisions": eng.explains.iter().rev().take(12).collect::<Vec<_>>()
     })
 }
