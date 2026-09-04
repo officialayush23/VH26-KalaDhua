@@ -5,9 +5,8 @@
     "dockerfilePath": "deploy/Dockerfile.engine"
   },
   "deploy": {
-    "startCommand": "aura --bind 0.0.0.0:$PORT --config /app/config/default.toml --models /app/models --real-values",
     "healthcheckPath": "/healthz",
-    "healthcheckTimeout": 30,
+    "healthcheckTimeout": 60,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 5,
     "numReplicas": 1

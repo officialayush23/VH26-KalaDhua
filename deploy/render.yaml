@@ -1,0 +1,70 @@
+# Render blueprint. Three services from one repository, each built from its own Dockerfile
+# with the repository root as context.
+#
+# Render sets PORT and routes to nothing else, which is why the engine and the applications
+# read it rather than hardcoding 8080/8101/8102.
+#
+# Secrets are marked sync:false so they are never written into the repository; set them once
+# in the Render dashboard and they persist across deploys.
+
+services:
+  - type: web
+    name: aura-engine
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile.engine
+    dockerContext: .
+    plan: starter          # 512 MB. Keep the pool at 128 MB; --real-values holds real bytes.
+    healthCheckPath: /healthz
+    envVars:
+      - key: RUST_LOG
+        value: info
+      - key: AURA__CACHE__CAPACITY_BYTES
+        value: "134217728"
+      - key: AURA__CAPACITY__HOST_BUDGET_BYTES
+        value: "402653184"
+      - key: AURA__CAPACITY__AUTO
+        value: "true"
+      - key: AURA__PREDICTOR__KIND
+        value: gbdt
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_SECRET_KEY
+        sync: false
+
+  - type: web
+    name: aura-recommendation
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile.apps
+    dockerContext: .
+    plan: starter
+    dockerCommand: python -m recommendation.main
+    healthCheckPath: /health
+    envVars:
+      # Paste the engine's internal address here after its first deploy, in the form
+      # http://aura-engine:<port Render assigned>. Internal traffic does not leave Render,
+      # so the cache stays off the public internet even though the engine is a web service.
+      - key: AURA_APPS_AURA_BASE_URL
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+
+  - type: web
+    name: aura-analytics
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile.apps
+    dockerContext: .
+    plan: starter
+    dockerCommand: python -m analytics.main
+    healthCheckPath: /health
+    envVars:
+      # Paste the engine's internal address here after its first deploy, in the form
+      # http://aura-engine:<port Render assigned>. Internal traffic does not leave Render,
+      # so the cache stays off the public internet even though the engine is a web service.
+      - key: AURA_APPS_AURA_BASE_URL
+        sync: false
+      # Render has no IPv6 route out, so the direct Supabase host is unreachable from here.
+      # Set the transaction pooler DSN (port 6543) and nothing else.
+      - key: SUPABASE_TRANSACTION_URL
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO

@@ -19,6 +19,7 @@ to keep there.
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import Any
 
 import uvicorn
@@ -34,7 +35,9 @@ from content import objects
 from content.external_api import ExternalApiClient
 
 APPLICATION = "content"
-PORT = 8103
+# The platform picks the port in a deployed container (Railway, Render and Fly all
+# set PORT and route only to it). The local default keeps the compose ports stable.
+PORT = int(os.environ.get("PORT", 8103))
 
 
 class PriceRequest(BaseModel):

@@ -145,7 +145,11 @@ In rough priority order.
   aggregate be the regeneration cost the cache learns. Note the engine's own Supabase
   connection is done — this item is about the application services, which is the correct
   place for it since the cache data path must not go through Postgres.
-- **`deploy/` is empty.** No `docker-compose.yml`, no Dockerfiles, no Railway config.
+- **Deployment is written but never run.** `deploy/` now holds Dockerfiles for the engine,
+  the applications and the dashboard, a compose file, a Railway config and a Render
+  blueprint, and `docs/DEPLOY.md` walks through local, Railway, Render and Vercel. None of
+  it has been executed: there is no Docker daemon on the build machine, so no image has
+  been built even once. Treat every step as unverified until a container boots.
 - **CDN layer** in the telemetry contract is declared but not implemented; the frame
   omits it rather than reporting zeros.
 - **Multi-node.** `/v1/nodes` returns a single hardcoded node. Consistent hashing and

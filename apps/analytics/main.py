@@ -18,6 +18,7 @@ keeping them looks free, yet they are exactly the ones worth keeping.
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import Any
 
 import uvicorn
@@ -32,7 +33,9 @@ from common.service import AppService, build_app, configure_logging
 from common.settings import get_settings
 
 APPLICATION = "analytics"
-PORT = 8102
+# The platform picks the port in a deployed container (Railway, Render and Fly all
+# set PORT and route only to it). The local default keeps the compose ports stable.
+PORT = int(os.environ.get("PORT", 8102))
 BASE_LIMIT = 400
 KEY_SPACE = len(queries.WINDOW_DAYS) * queries.REGION_COUNT * 4
 

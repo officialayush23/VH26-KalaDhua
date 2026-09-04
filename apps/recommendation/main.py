@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from typing import Any
 
 import uvicorn
@@ -33,7 +34,9 @@ from recommendation import data, model
 APPLICATION = "recommendation"
 OBJECT_TYPE = "ranking_result"
 TTL_MS = 300_000
-PORT = 8101
+# The platform picks the port in a deployed container (Railway, Render and Fly all
+# set PORT and route only to it). The local default keeps the compose ports stable.
+PORT = int(os.environ.get("PORT", 8101))
 
 SEGMENTS = ("default", "mobile", "web", "loyalty")
 

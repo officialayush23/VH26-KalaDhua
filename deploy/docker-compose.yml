@@ -83,10 +83,14 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Third workload, off by default: `docker compose --profile content up`. The two that
+  # matter are recommendation (CPU heavy) and analytics (database heavy); content is a
+  # third cost shape and adds nothing the other two do not already show.
   content:
     build: *apps_build
     image: aura/apps:latest
     container_name: aura-content
+    profiles: ["content"]
     command: ["python", "-m", "content.main"]
     environment: *apps_env
     env_file:
@@ -132,7 +136,6 @@ services:
       - --duration=${SIM_DURATION:-600}
       - --endpoint=recommendation=http://recommendation:8101
       - --endpoint=analytics=http://analytics:8102
-      - --endpoint=content=http://content:8103
       - --aura-url=http://engine:8080
       - --log-file=/app/runs/requests.jsonl
     environment: *apps_env
@@ -141,7 +144,6 @@ services:
     depends_on:
       - recommendation
       - analytics
-      - content
     restart: "no"
 
   # ------------------------------------------------------------------ the dashboard

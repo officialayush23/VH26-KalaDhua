@@ -61,6 +61,17 @@ class Settings(BaseSettings):
             "SUPABASE_DIRECT_CONNECTION_URL",
         ),
     )
+    # Supabase hands out two DSNs. The direct one resolves to an IPv6-only host, which a
+    # laptop and Railway can reach but Render's containers cannot; the transaction pooler is
+    # dual-stack. Both are accepted and tried in that order, so the same image runs anywhere.
+    supabase_pooler_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "AURA_APPS_SUPABASE_POOLER_URL",
+            "SUPABASE_POOLER_URL",
+            "SUPABASE_TRANSACTION_URL",
+        ),
+    )
     db_statement_timeout_ms: int = 15_000
     db_pool_min_size: int = 1
     db_pool_max_size: int = 8

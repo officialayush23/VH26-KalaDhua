@@ -13,6 +13,7 @@ WORKDIR /build
 # changes, so copying manifests first and building a stub means a source edit rebuilds only
 # our crates — seconds instead of minutes.
 COPY engine/Cargo.toml ./Cargo.toml
+COPY engine/Cargo.lock ./Cargo.lock
 COPY engine/aura-core/Cargo.toml ./aura-core/Cargo.toml
 COPY engine/aura-sim/Cargo.toml ./aura-sim/Cargo.toml
 COPY engine/aura-server/Cargo.toml ./aura-server/Cargo.toml
@@ -20,7 +21,7 @@ RUN mkdir -p aura-core/src aura-sim/src aura-server/src \
  && echo "" > aura-core/src/lib.rs \
  && echo "" > aura-sim/src/lib.rs \
  && echo "fn main() {}" > aura-server/src/main.rs \
- && cargo build --release --locked 2>/dev/null || cargo build --release
+ && (cargo build --release --locked || cargo build --release)
 
 COPY engine/ ./
 # Cargo caches by mtime; the stub sources above are newer than the real ones we just copied.
@@ -38,7 +39,8 @@ RUN apt-get update \
 RUN useradd --system --create-home --uid 10001 aura
 WORKDIR /app
 
-COPY --from=build /build/target/release/aura-server /usr/local/bin/aura
+# The crate is aura-server; the binary it produces is `aura` (see its [[bin]] section).
+COPY --from=build /build/target/release/aura /usr/local/bin/aura
 COPY engine/config/ /app/config/
 RUN mkdir -p /app/models && chown -R aura:aura /app
 

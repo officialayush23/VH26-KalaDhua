@@ -119,22 +119,36 @@ class PostgresBackend:
         self._dsn = dsn
         self._settings = settings
         self._pool: Any | None = None
+        # The transaction pooler hands a different backend to every statement, so asyncpg's
+        # prepared-statement cache addresses objects that are not there on the next call.
+        # Turning it off is the documented requirement, not a tuning choice.
+        self._pooled = ":6543" in dsn or "pooler.supabase.com" in dsn
 
     async def start(self) -> None:
         """Create the pool and pin a statement timeout on every connection."""
         import asyncpg  # imported lazily so the SQLite path needs no driver
 
+        extra: dict[str, Any] = {}
+        if self._pooled:
+            # No prepared statements and no startup parameters through pgbouncer; the client
+            # side command timeout still bounds a slow query.
+            extra["statement_cache_size"] = 0
+        else:
+            extra["server_settings"] = {
+                "statement_timeout": str(self._settings.db_statement_timeout_ms),
+                "application_name": "aura-analytics",
+            }
         self._pool = await asyncpg.create_pool(
             dsn=self._dsn,
             min_size=self._settings.db_pool_min_size,
             max_size=self._settings.db_pool_max_size,
             command_timeout=self._settings.db_statement_timeout_ms / 1000.0,
-            server_settings={
-                "statement_timeout": str(self._settings.db_statement_timeout_ms),
-                "application_name": "aura-analytics",
-            },
+            **extra,
         )
-        log.info("postgres pool ready", extra={"event": "db_ready", "backend": "postgres"})
+        log.info(
+            "postgres pool ready",
+            extra={"event": "db_ready", "backend": "postgres", "pooled": self._pooled},
+        )
 
     async def close(self) -> None:
         """Close the pool."""
@@ -275,16 +289,21 @@ async def open_backend(settings: Settings) -> Backend:
     A failure to reach Postgres is not fatal: the application logs it and falls
     back, because a demo that will not start is worse than a demo on fixtures.
     """
-    dsn = settings.supabase_direct_connection_url
-    if dsn:
+    for label, dsn in (
+        ("direct", settings.supabase_direct_connection_url),
+        ("pooler", settings.supabase_pooler_url),
+    ):
+        if not dsn:
+            continue
         backend: Backend = PostgresBackend(dsn, settings)
         try:
             await backend.start()
+            log.info("postgres ready", extra={"event": "db_route", "route": label})
             return backend
         except Exception as exc:
             log.warning(
-                "postgres unavailable, falling back to sqlite fixture",
-                extra={"event": "db_fallback", "error": repr(exc)},
+                "postgres route unavailable",
+                extra={"event": "db_route_failed", "route": label, "error": repr(exc)},
             )
     backend = SqliteBackend(settings.sqlite_path, settings)
     await backend.start()

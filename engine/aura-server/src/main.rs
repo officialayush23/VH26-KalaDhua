@@ -38,11 +38,33 @@ use crate::consistency::InvalidationMode;
 use crate::engine::Engine;
 use crate::policy::Policy;
 
+/// Resolve what to listen on, in the order a deployed process should: the explicit flag,
+/// then the platform's `PORT`, then the local default. A bare port is expanded to all
+/// interfaces, because binding to loopback inside a container makes the service
+/// unreachable while looking perfectly healthy from the inside.
+fn listen_addr(flag: Option<&str>) -> anyhow::Result<SocketAddr> {
+    let raw = match flag {
+        Some(v) => v.to_string(),
+        None => match std::env::var("PORT") {
+            Ok(p) if !p.trim().is_empty() => format!("0.0.0.0:{}", p.trim()),
+            _ => "0.0.0.0:8080".to_string(),
+        },
+    };
+    if let Ok(port) = raw.parse::<u16>() {
+        return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
+    }
+    raw.parse::<SocketAddr>()
+        .map_err(|err| anyhow::anyhow!("cannot parse listen address {raw:?}: {err}"))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "aura", version, about = "AURA cache server")]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0:8080")]
-    bind: String,
+    /// Listen address. When the flag is absent the platform's `PORT` is used if it set one
+    /// (Railway, Render and Fly all do and route to nothing else), otherwise 0.0.0.0:8080.
+    /// A bare port number is accepted as well.
+    #[arg(long)]
+    bind: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long, default_value = "models")]
@@ -289,7 +311,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(app);
 
-    let addr: SocketAddr = args.bind.parse()?;
+    let addr = listen_addr(args.bind.as_deref())?;
     tracing::info!(%addr, "aura listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;

@@ -59,9 +59,9 @@ python -m driver.run_universe --spawn --rps 200 --duration 300
 per-application panel fills from real services, and `db_ms` comes from asyncpg round trips
 rather than the generator.
 
-**Known gap.** `AURA_APPS_SUPABASE_DIRECT_CONNECTION_URL` must be set for the analytics app
-to use Supabase rather than SQLite. It is in `backend/.env` under a different name; either
-export it or add the alias to `apps/common/settings.py`.
+**Closed.** `apps/common/settings.py` accepts the unprefixed `SUPABASE_DIRECT_CONNECTION_URL`
+and `SUPABASE_TRANSACTION_URL` names that `backend/.env` already uses, so no export is
+needed. `GET /health` on the analytics app reports which backend it actually opened.
 
 ---
 
@@ -157,9 +157,20 @@ the thing that would make the economic head genuinely yours.
 
 ## 7. Deployment
 
-`deploy/` is empty. No Dockerfiles, no `docker-compose.yml`, no Railway config. The plan is
-one compose file with the engine, the three apps and the dashboard, and the same containers
-pushed to Railway. Nothing about the code blocks this; it has simply not been written.
+Written, not yet run. `deploy/` holds `Dockerfile.engine`, `Dockerfile.apps`,
+`Dockerfile.dashboard`, `docker-compose.yml`, `railway.json`, `render.yaml` and
+`nginx.conf`; `docs/DEPLOY.md` is the step-by-step for local, Railway, Render and Vercel.
+
+Four blockers were found by reading and are fixed: the engine image copied
+`target/release/aura-server` when the binary is `aura`; the dependency layer never copied
+`Cargo.lock`; neither the engine nor the applications read `PORT`, which is the only port a
+Railway or Render container is routed on; and the analytics app could only use Supabase's
+IPv6-only direct host, which Render cannot reach, so the transaction pooler is now a
+fallback with asyncpg's statement cache disabled for it.
+
+Still open: no authentication on any route, which matters the moment the engine has a
+public URL, and no image has been built even once because there is no Docker daemon on the
+build machine.
 
 ---
 
