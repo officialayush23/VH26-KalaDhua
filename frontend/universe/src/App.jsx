@@ -90,7 +90,7 @@ export function App() {
                 <h1 className="text-[30px] font-semibold leading-none tracking-tight">
                   AURA
                 </h1>
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium">
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium">
                   <span className={cn("h-1.5 w-1.5 rounded-full", s.tone)} />
                   {s.label}
                 </span>
@@ -131,7 +131,7 @@ export function App() {
             <p className="mt-1.5 text-[13.5px] text-muted-foreground">
               This page is fine, it just has nothing to talk to. In a terminal:
             </p>
-            <pre className="mt-3 overflow-x-auto rounded-lg border border-border bg-muted/40 px-3.5 py-2.5 font-mono text-[12.5px]">
+            <pre className="mt-3 overflow-x-auto rounded-lg border border-border bg-muted/40 px-3.5 py-2.5 font-mono text-[13.5px]">
               cd engine{"\n"}cargo run --release -p aura-server -- --scenario mixed_production
             </pre>
           </div>
@@ -146,7 +146,7 @@ export function App() {
               key={t.id}
               onClick={() => setTab(t.id)}
               className={cn(
-                "rounded-lg px-3.5 py-2 text-[13px] font-medium transition-colors",
+                "rounded-lg px-3.5 py-2 text-[13.5px] font-medium transition-colors",
                 tab === t.id
                   ? "bg-primary text-primary-foreground"
                   : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
@@ -235,7 +235,7 @@ export function App() {
           )}
         </div>
 
-        <footer className="mt-8 border-t border-border/50 pt-4 text-[12px] text-muted-foreground">
+        <footer className="mt-8 border-t border-border/80 pt-4 text-[12px] text-muted-foreground">
           Press <kbd className="rounded border border-border px-1">d</kbd> to switch between
           light and dark.
         </footer>
@@ -247,7 +247,7 @@ export function App() {
 function MiniStat({ label, value }) {
   return (
     <div className="rounded-xl border border-border bg-card px-3.5 py-2">
-      <div className="text-[10.5px] uppercase tracking-[0.08em] text-muted-foreground">
+      <div className="text-[12px] uppercase tracking-[0.08em] text-muted-foreground">
         {label}
       </div>
       <div className="mt-0.5 font-mono text-[17px] tabular-nums">{value}</div>

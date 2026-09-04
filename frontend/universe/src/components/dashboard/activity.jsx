@@ -104,11 +104,11 @@ export function ActivityLog({ log = [], status, className }) {
         className
       )}
     >
-      <header className="border-b border-border/50 px-5 py-4">
+      <header className="border-b border-border/80 px-5 py-4">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0">
             <h2 className="text-[15px] font-semibold tracking-tight">Decision log</h2>
-            <p className="mt-1 text-[13px] leading-snug text-muted-foreground">
+            <p className="mt-1 text-[13.5px] leading-snug text-muted-foreground">
               Every choice the cache made, in the words it made it in, with the numbers that
               produced it.
             </p>
@@ -118,7 +118,7 @@ export function ActivityLog({ log = [], status, className }) {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Filter by key, app or words"
-              className="h-8 w-56 rounded-lg border border-border bg-background px-2.5 text-[12.5px] outline-none placeholder:text-muted-foreground/60 focus:border-primary/50"
+              className="h-8 w-56 rounded-lg border border-border bg-background px-2.5 text-[13.5px] outline-none placeholder:text-muted-foreground focus:border-primary/50"
             />
             <button
               type="button"
@@ -153,13 +153,13 @@ export function ActivityLog({ log = [], status, className }) {
                 )}
               >
                 {g.label}
-                <span className="ml-1.5 font-mono text-[11px] tabular-nums opacity-60">
+                <span className="ml-1.5 font-mono text-[12px] tabular-nums opacity-60">
                   {n}
                 </span>
               </button>
             )
           })}
-          <span className="ml-auto flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
+          <span className="ml-auto flex items-center gap-1.5 text-[12px] text-muted-foreground">
             <span
               className={cn(
                 "h-1.5 w-1.5 rounded-full",
@@ -174,12 +174,12 @@ export function ActivityLog({ log = [], status, className }) {
       <div
         ref={listRef}
         onScroll={onScroll}
-        className="min-h-0 flex-1 divide-y divide-border/40 overflow-y-auto"
+        className="min-h-0 flex-1 divide-y divide-border/70 overflow-y-auto"
       >
         {rows.length === 0 && (
           <div className="px-5 py-10 text-center">
             <p className="text-[13.5px] font-medium">Nothing to show yet.</p>
-            <p className="mt-1 text-[12.5px] text-muted-foreground">
+            <p className="mt-1 text-[13.5px] text-muted-foreground">
               {log.length === 0
                 ? "The cache writes a line every time it keeps, refuses, evicts or invalidates something. Start traffic and this fills."
                 : "No entries match this filter."}
@@ -191,7 +191,7 @@ export function ActivityLog({ log = [], status, className }) {
         ))}
       </div>
 
-      <footer className="flex items-center justify-between border-t border-border/50 px-5 py-2.5 text-[11.5px] text-muted-foreground">
+      <footer className="flex items-center justify-between border-t border-border/80 px-5 py-2.5 text-[12px] text-muted-foreground">
         <span>
           {rows.length.toLocaleString()} shown, {log.length.toLocaleString()} in scrollback
         </span>
@@ -224,12 +224,12 @@ function LogRow({ entry }) {
           SEVERITY_RAIL[entry.severity] ?? SEVERITY_RAIL.info
         )}
       />
-      <time className="mt-[3px] w-[62px] shrink-0 font-mono text-[11.5px] tabular-nums text-muted-foreground">
+      <time className="mt-[3px] w-[62px] shrink-0 font-mono text-[12px] tabular-nums text-muted-foreground">
         {clockOf(entry)}
       </time>
       <span
         className={cn(
-          "mt-[1px] h-[21px] shrink-0 rounded-md border px-2 text-[10.5px] font-semibold uppercase leading-[19px] tracking-[0.06em]",
+          "mt-[1px] h-[21px] shrink-0 rounded-md border px-2 text-[12px] font-semibold uppercase leading-[19px] tracking-[0.06em]",
           tone
         )}
       >
@@ -238,16 +238,16 @@ function LogRow({ entry }) {
 
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-          <span className="truncate font-mono text-[12.5px] text-foreground/90">
+          <span className="truncate font-mono text-[13.5px] text-foreground/90">
             {entry.subject}
           </span>
           {entry.application && entry.application !== "engine" && (
-            <span className="rounded border border-border px-1.5 text-[10.5px] text-muted-foreground">
+            <span className="rounded border border-border px-1.5 text-[12px] text-muted-foreground">
               {entry.application}
             </span>
           )}
         </div>
-        <p className="mt-1 text-[13px] leading-snug text-muted-foreground">
+        <p className="mt-1 text-[13.5px] leading-snug text-muted-foreground">
           {entry.message}
         </p>
         {Array.isArray(entry.facts) && entry.facts.length > 0 && (
@@ -255,7 +255,7 @@ function LogRow({ entry }) {
             {entry.facts.map((f, i) => (
               <span
                 key={`${entry.seq}-${f.name}-${i}`}
-                className="rounded bg-muted/50 px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                className="rounded bg-muted/50 px-1.5 py-0.5 text-[12px] text-muted-foreground"
               >
                 <span className="opacity-60">{f.name}</span>{" "}
                 <span className="font-mono tabular-nums text-foreground/80">{f.value}</span>

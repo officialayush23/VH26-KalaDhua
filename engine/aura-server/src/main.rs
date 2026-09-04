@@ -546,7 +546,10 @@ fn build_frame(app: &Shared) -> Value {
             }
         },
         "fidelity": {
-            "traffic": "simulated",
+            // Where the requests came from, not what we wish they came from. The generator
+            // only runs when a scenario was started; with it stopped, every request on this
+            // engine arrived over HTTP from an application that did the work itself.
+            "traffic": if sim_running { "simulated" } else { "applications" },
             "values_stored": app.real_values,
             "backend": {
                 "enabled": probe.enabled,

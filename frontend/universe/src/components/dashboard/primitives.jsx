@@ -52,13 +52,13 @@ export function Panel({ title, subtitle, actions, footer, className, children })
       )}
     >
       {(title || actions) && (
-        <header className="flex items-start justify-between gap-4 border-b border-border/50 px-5 py-4">
+        <header className="flex items-start justify-between gap-4 border-b border-border/80 px-5 py-4">
           <div className="min-w-0">
             {title && (
               <h2 className="text-[15px] font-semibold tracking-tight">{title}</h2>
             )}
             {subtitle && (
-              <p className="mt-1 text-[13px] leading-snug text-muted-foreground">
+              <p className="mt-1 text-[13.5px] leading-snug text-muted-foreground">
                 {subtitle}
               </p>
             )}
@@ -68,7 +68,7 @@ export function Panel({ title, subtitle, actions, footer, className, children })
       )}
       <div className="flex-1 px-5 py-4">{children}</div>
       {footer && (
-        <footer className="border-t border-border/50 px-5 py-3 text-[12px] text-muted-foreground">
+        <footer className="border-t border-border/80 px-5 py-3 text-[12px] text-muted-foreground">
           {footer}
         </footer>
       )}
@@ -93,8 +93,8 @@ export function Metric({ label, value, unit, explain, tone = "default", size = "
     lg: "text-[38px]",
   }
   return (
-    <div className="flex flex-col rounded-xl border border-border/60 bg-background/50 px-4 py-3">
-      <div className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+    <div className="flex flex-col rounded-xl border border-border bg-background/80 px-4 py-3">
+      <div className="text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
         {label}
       </div>
       <div className="mt-1.5 flex items-baseline gap-1.5">
@@ -108,7 +108,7 @@ export function Metric({ label, value, unit, explain, tone = "default", size = "
           {value}
         </span>
         {unit && (
-          <span className="text-[13px] font-medium text-muted-foreground">{unit}</span>
+          <span className="text-[13.5px] font-medium text-muted-foreground">{unit}</span>
         )}
       </div>
       {explain && (
@@ -176,7 +176,7 @@ export function Gauge({ fraction, label, value, tone = "stroke-primary" }) {
       </svg>
       <div className="-mt-[4.6rem] mb-8 text-center">
         <div className="font-mono text-2xl font-medium tabular-nums">{value}</div>
-        <div className="mt-0.5 text-[11px] uppercase tracking-wide text-muted-foreground">
+        <div className="mt-0.5 text-[12px] uppercase tracking-wide text-muted-foreground">
           {label}
         </div>
       </div>
@@ -200,7 +200,7 @@ export function LineChart({
     return (
       <div
         style={{ height }}
-        className="flex items-center justify-center rounded-lg border border-dashed border-border/60 text-[12px] text-muted-foreground"
+        className="flex items-center justify-center rounded-lg border border-dashed border-border text-[12px] text-muted-foreground"
       >
         collecting data
       </div>
@@ -271,7 +271,7 @@ export function LineChart({
         ))}
       </svg>
       {(yLabel || xLabel) && (
-        <div className="mt-1 flex justify-between text-[11px] text-muted-foreground">
+        <div className="mt-1 flex justify-between text-[12px] text-muted-foreground">
           <span>{yLabel}</span>
           <span>{xLabel}</span>
         </div>
@@ -307,7 +307,7 @@ export function Pill({ children, tone = "default" }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-medium",
+        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[12px] font-medium",
         tones[tone]
       )}
     >

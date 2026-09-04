@@ -115,9 +115,9 @@ export function Headline({ frame, history }) {
             explain="95 of every 100 requests are faster than this."
             tone={(latency.p95_ms ?? 0) > 150 ? "warn" : "good"}
           />
-          <div className="rounded-xl border border-border/60 bg-background/50 px-4 py-3">
+          <div className="rounded-xl border border-border bg-background/80 px-4 py-3">
             <div className="flex items-baseline justify-between">
-              <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+              <span className="text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
                 Memory in use
               </span>
               <span className="font-mono text-sm tabular-nums">{pct(cap.pressure ?? 0, 0)}</span>
@@ -180,7 +180,7 @@ export function CostPanel({ frame }) {
               <span className="flex items-center gap-2">
                 <span
                   className={cn(
-                    "font-mono text-[13px]",
+                    "font-mono text-[13.5px]",
                     r.policy === "aura" ? "font-semibold text-primary" : "text-foreground"
                   )}
                 >
@@ -189,14 +189,14 @@ export function CostPanel({ frame }) {
                 {i === 0 && <Pill tone="good">cheapest</Pill>}
                 {r.policy === "aura" && i !== 0 && <Pill tone="accent">this engine</Pill>}
               </span>
-              <span className="font-mono text-[13px] tabular-nums">{usd(r.total)}</span>
+              <span className="font-mono text-[13.5px] tabular-nums">{usd(r.total)}</span>
             </div>
             <Bar
               fraction={(r.total || 0) / max}
               height="h-2.5"
               tone={r.policy === "aura" ? "bg-primary" : "bg-muted-foreground/35"}
             />
-            <div className="mt-1 flex flex-wrap gap-x-4 text-[11px] text-muted-foreground">
+            <div className="mt-1 flex flex-wrap gap-x-4 text-[12px] text-muted-foreground">
               <span>hit rate {r.hit !== null ? pct(r.hit) : "—"}</span>
               {r.regen !== null && <span>rebuild {usd(r.regen)}</span>}
               {r.penalty !== null && <span>SLA penalty {usd(r.penalty)}</span>}
@@ -257,7 +257,7 @@ export function PolicyPanel({ frame }) {
       />
 
       {leader && (
-        <p className="mt-3 rounded-lg border border-border/60 bg-background px-3 py-2 text-[12.5px] leading-snug">
+        <p className="mt-3 rounded-lg border border-border bg-background px-3 py-2 text-[13.5px] leading-snug">
           <span className="font-medium">Leaning on {leader[0]}</span>{" "}
           <span className="text-muted-foreground">
             ({pct(leader[1], 0)} of the blend) — {POLICY_MEANING[leader[0]]}.
@@ -265,16 +265,16 @@ export function PolicyPanel({ frame }) {
         </p>
       )}
 
-      <div className="mt-4 rounded-xl border border-border/60 bg-background/40 p-4">
+      <div className="mt-4 rounded-xl border border-border bg-background/40 p-4">
         <div className="flex items-center gap-2">
-          <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+          <span className="text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
             Detected traffic pattern
           </span>
           <Pill tone={workload.regime === "Scan" ? "warn" : "default"}>
             {workload.regime ?? "—"} · {pct(workload.confidence ?? 0, 0)} confident
           </Pill>
         </div>
-        <p className="mt-2 text-[12.5px] leading-snug text-muted-foreground">
+        <p className="mt-2 text-[13.5px] leading-snug text-muted-foreground">
           {REGIME_EXPLAIN[workload.regime] ?? "Waiting for enough traffic to classify."}
         </p>
         <div className="mt-3 grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-3">
@@ -299,7 +299,7 @@ function Signal({ label, value, explain, fmt }) {
           {value === undefined ? "—" : fmt ? fmt(value) : Number(value).toFixed(3)}
         </span>
       </div>
-      <div className="text-[10.5px] leading-tight text-muted-foreground/70">{explain}</div>
+      <div className="text-[12px] leading-tight text-muted-foreground">{explain}</div>
     </div>
   )
 }
@@ -346,7 +346,7 @@ export function CapacityPanel({ frame }) {
           explain={`after ${usd(m.cache_cost_usd_hr ?? 0)}/hr of memory rent`} />
       </div>
       <div className="mt-4">
-        <div className="mb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+        <div className="mb-1 text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
           Hit rate against pool size
         </div>
         <LineChart
@@ -395,13 +395,13 @@ export function DecisionFeed({ frame }) {
     >
       <div ref={listRef} className="max-h-[30rem] space-y-2 overflow-y-auto pr-1">
         {decisions.length === 0 && (
-          <p className="text-[13px] text-muted-foreground">Waiting for traffic.</p>
+          <p className="text-[13.5px] text-muted-foreground">Waiting for traffic.</p>
         )}
         {decisions.map((d, i) => (
           <article
             key={`${d.key}-${d.t}-${i}`}
             data-k={`${d.key}-${d.t}`}
-            className="rounded-xl border border-border/60 bg-background/40 p-3"
+            className="rounded-xl border border-border bg-background/40 p-3"
           >
             <div className="flex items-center gap-2">
               <span
@@ -416,7 +416,7 @@ export function DecisionFeed({ frame }) {
               </span>
               <span className="truncate font-mono text-[12px]">{d.key}</span>
             </div>
-            <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
+            <div className="mt-2 grid grid-cols-3 gap-2 text-[12px]">
               <Field label="rebuild cost" value={usd(d.economic_value_usd ?? 0, 6)} />
               <Field label="chance of reuse" value={pct(d.reuse_probability?.h60s ?? 0, 0)} />
               <Field
@@ -425,7 +425,7 @@ export function DecisionFeed({ frame }) {
               />
             </div>
             {d.reasons?.length > 0 && (
-              <p className="mt-2 text-[11.5px] leading-snug text-muted-foreground">
+              <p className="mt-2 text-[12px] leading-snug text-muted-foreground">
                 {d.reasons[0]}
               </p>
             )}
@@ -458,18 +458,18 @@ export function ApplicationsPanel({ frame }) {
       subtitle="Three services with different cost shapes. This is why a single global policy underperforms: the right trade-off for a 40 KB query result is not the right one for a 2 MB media file."
     >
       <div className="space-y-3">
-        {apps.length === 0 && <p className="text-[13px] text-muted-foreground">No traffic yet.</p>}
+        {apps.length === 0 && <p className="text-[13.5px] text-muted-foreground">No traffic yet.</p>}
         {apps.map((a) => (
-          <div key={a.application} className="rounded-xl border border-border/60 bg-background/40 p-3">
+          <div key={a.application} className="rounded-xl border border-border bg-background/40 p-3">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[13px] font-medium">{a.application}</span>
+              <span className="text-[13.5px] font-medium">{a.application}</span>
               <Pill>{PROFILE[a.cost_profile] ?? a.cost_profile}</Pill>
-              <span className="ml-auto font-mono text-[13px] tabular-nums">{pct(a.hit_rate)}</span>
+              <span className="ml-auto font-mono text-[13.5px] tabular-nums">{pct(a.hit_rate)}</span>
             </div>
             <div className="mt-2">
               <Bar fraction={a.hit_rate} tone="bg-primary/70" />
             </div>
-            <div className="mt-2 grid grid-cols-4 gap-2 text-[11px]">
+            <div className="mt-2 grid grid-cols-4 gap-2 text-[12px]">
               <Field label="requests" value={Number(a.requests ?? 0).toLocaleString()} />
               <Field label="avg size" value={bytes(a.avg_object_bytes)} />
               <Field label="rebuild time" value={ms(a.regen_p50_ms)} />
@@ -513,7 +513,7 @@ export function EventsPanel({ frame }) {
   return (
     <Panel title="Event log" subtitle="Capacity changes, policy shifts and injected disturbances.">
       <div className="max-h-64 space-y-1.5 overflow-y-auto pr-1">
-        {events.length === 0 && <p className="text-[13px] text-muted-foreground">Quiet.</p>}
+        {events.length === 0 && <p className="text-[13.5px] text-muted-foreground">Quiet.</p>}
         {events.map((e, i) => (
           <div key={`${e.t}-${i}`} className="flex gap-2.5 text-[12px]">
             <span className="w-14 shrink-0 text-right font-mono text-muted-foreground">
@@ -576,11 +576,11 @@ export function Controls({ frame, send, status }) {
     >
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+          <label className="text-[12px] uppercase tracking-wide text-muted-foreground">
             Traffic pattern
           </label>
           <select
-            className="h-9 min-w-52 rounded-lg border border-border bg-background px-2.5 text-[13px]"
+            className="h-9 min-w-52 rounded-lg border border-border bg-background px-2.5 text-[13.5px]"
             value={sim.scenario ?? ""}
             onChange={(e) => post("/v1/sim/start", { scenario: e.target.value, speed: sim.speed ?? 1 })}
             disabled={status === "offline"}
@@ -594,7 +594,7 @@ export function Controls({ frame, send, status }) {
           </select>
         </div>
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+          <label className="text-[12px] uppercase tracking-wide text-muted-foreground">
             Speed
           </label>
           <div className="flex items-center gap-1">
@@ -614,7 +614,7 @@ export function Controls({ frame, send, status }) {
         </div>
 
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+          <label className="text-[12px] uppercase tracking-wide text-muted-foreground">
             Traffic
           </label>
           <div className="flex items-center gap-1.5">
@@ -659,7 +659,7 @@ export function Controls({ frame, send, status }) {
       </div>
 
       <div className="mt-4">
-        <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+        <label className="text-[12px] uppercase tracking-wide text-muted-foreground">
           Throw a disturbance
         </label>
         <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
@@ -675,8 +675,8 @@ export function Controls({ frame, send, status }) {
                   : "border-border/70 bg-background/40 hover:border-primary/50 hover:bg-accent/40"
               )}
             >
-              <div className="text-[12.5px] font-medium">{a.label}</div>
-              <div className="mt-0.5 text-[11px] leading-tight text-muted-foreground">
+              <div className="text-[13.5px] font-medium">{a.label}</div>
+              <div className="mt-0.5 text-[12px] leading-tight text-muted-foreground">
                 {a.hint}
               </div>
             </button>
@@ -720,7 +720,7 @@ export function BenchPanel() {
       actions={
         <div className="flex items-center gap-2">
           <select
-            className="h-9 rounded-lg border border-border bg-background px-2.5 text-[13px]"
+            className="h-9 rounded-lg border border-border bg-background px-2.5 text-[13.5px]"
             value={scenario}
             onChange={(e) => setScenario(e.target.value)}
           >
@@ -749,15 +749,15 @@ export function BenchPanel() {
       }
     >
       {!report && (
-        <div className="flex h-40 items-center justify-center rounded-xl border border-dashed border-border/60 text-[13px] text-muted-foreground">
+        <div className="flex h-40 items-center justify-center rounded-xl border border-dashed border-border text-[13.5px] text-muted-foreground">
           Press run to compare the policies.
         </div>
       )}
       {report && (
         <div className="overflow-x-auto">
-          <table className="w-full text-[13px]">
+          <table className="w-full text-[13.5px]">
             <thead>
-              <tr className="border-b border-border text-[11px] uppercase tracking-wide text-muted-foreground">
+              <tr className="border-b border-border text-[12px] uppercase tracking-wide text-muted-foreground">
                 <th className="py-2 text-left font-medium">Policy</th>
                 <th className="py-2 text-right font-medium">Hit rate</th>
                 <th className="py-2 text-right font-medium">Byte hit rate</th>
@@ -771,7 +771,7 @@ export function BenchPanel() {
                 <tr
                   key={r.policy}
                   className={cn(
-                    "border-b border-border/40",
+                    "border-b border-border/70",
                     r.policy === best?.policy && "bg-primary/5 font-semibold text-primary"
                   )}
                 >
@@ -832,7 +832,7 @@ export function SupabasePanel() {
       subtitle="Model registry, benchmark history and events."
       actions={<Pill tone={tone}>{label}</Pill>}
     >
-      <div className="space-y-2 text-[12.5px]">
+      <div className="space-y-2 text-[13.5px]">
         <Row label="Active models" value={
           state?.active_models?.length ? state.active_models.join(", ") : "none published yet"
         } />
@@ -857,7 +857,7 @@ export function SupabasePanel() {
 
 function Row({ label, value }) {
   return (
-    <div className="flex items-baseline justify-between gap-3 border-b border-border/40 pb-1.5">
+    <div className="flex items-baseline justify-between gap-3 border-b border-border/70 pb-1.5">
       <span className="text-muted-foreground">{label}</span>
       <span className="text-right font-mono text-[12px]">{value}</span>
     </div>
@@ -908,7 +908,7 @@ export function ModelPanel({ frame }) {
           explain="the rest is the classical policy blend" />
       </div>
 
-      <ol className="mt-4 space-y-2 text-[12.5px]">
+      <ol className="mt-4 space-y-2 text-[13.5px]">
         <Step n="1" title="Train it in Colab"
           body="Open training/notebooks/aura_training_colab.ipynb, add your two Supabase secrets, run every cell." />
         <Step n="2" title="It uploads itself"
@@ -939,7 +939,7 @@ export function ModelPanel({ frame }) {
 function Step({ n, title, body }) {
   return (
     <li className="flex gap-2.5">
-      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-muted font-mono text-[11px]">
+      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-muted font-mono text-[12px]">
         {n}
       </span>
       <span>

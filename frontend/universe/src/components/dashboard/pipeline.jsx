@@ -80,7 +80,7 @@ export function Pipeline({ frame }) {
               style={{ width: `${(1 - hitFrac) * 100}%` }}
             />
           </div>
-          <div className="mt-1.5 flex justify-between text-[11px] text-muted-foreground">
+          <div className="mt-1.5 flex justify-between text-[12px] text-muted-foreground">
             <span>{Number(hits).toLocaleString()} hits served here</span>
             <span>{Number(misses).toLocaleString()} missed</span>
           </div>
@@ -123,21 +123,21 @@ export function Pipeline({ frame }) {
         >
           <div className="mt-2.5 grid gap-2 sm:grid-cols-3">
             {apps.length === 0 && (
-              <div className="col-span-3 text-[11.5px] text-muted-foreground">
+              <div className="col-span-3 text-[12px] text-muted-foreground">
                 No per-application traffic yet.
               </div>
             )}
             {apps.map((a) => (
-              <div key={a.application} className="rounded-lg border border-border/60 px-2.5 py-2">
+              <div key={a.application} className="rounded-lg border border-border px-2.5 py-2">
                 <div className="text-[12px] font-medium">{a.application}</div>
-                <div className="mt-0.5 text-[10.5px] text-muted-foreground">
+                <div className="mt-0.5 text-[12px] text-muted-foreground">
                   {a.cost_profile === "db_heavy"
                     ? "queries the database"
                     : a.cost_profile === "gpu_heavy"
                       ? "runs GPU work"
                       : "CPU plus a query"}
                 </div>
-                <div className="mt-1 font-mono text-[11px] tabular-nums">
+                <div className="mt-1 font-mono text-[12px] tabular-nums">
                   {ms(a.regen_p50_ms)} · {bytes(a.avg_object_bytes)}
                 </div>
               </div>
@@ -179,11 +179,11 @@ export function Pipeline({ frame }) {
           </div>
         </Stage>
 
-        <div className="rounded-xl border border-border/60 bg-muted/20 px-4 py-3">
-          <div className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+        <div className="rounded-xl border border-border bg-muted/20 px-4 py-3">
+          <div className="text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
             Off the request path entirely
           </div>
-          <p className="mt-1.5 text-[12.5px] leading-snug text-muted-foreground">
+          <p className="mt-1.5 text-[13.5px] leading-snug text-muted-foreground">
             Supabase holds the trained model, the benchmark history and the event log. The
             engine reads it on boot and writes to it after a benchmark. It is never consulted
             to answer a request — if it were, the cache would be pointless.
@@ -201,7 +201,7 @@ function Stage({ title, right, body, tone, children }) {
         <h3 className="text-[13.5px] font-semibold">{title}</h3>
         <span className="font-mono text-[12px] tabular-nums text-muted-foreground">{right}</span>
       </div>
-      <p className="mt-1 text-[12.5px] leading-snug text-muted-foreground">{body}</p>
+      <p className="mt-1 text-[13.5px] leading-snug text-muted-foreground">{body}</p>
       {children}
     </div>
   )
@@ -211,7 +211,7 @@ function Connector({ label }) {
   return (
     <div className="flex items-center gap-2 pl-4">
       <div className="h-5 w-px bg-border" />
-      {label && <span className="text-[11px] text-muted-foreground">{label}</span>}
+      {label && <span className="text-[12px] text-muted-foreground">{label}</span>}
     </div>
   )
 }
@@ -237,7 +237,7 @@ function Branch({ label, tone, share, arrow, rows, note }) {
           {label}
         </span>
         <span className="font-mono text-[12px] tabular-nums">{share}</span>
-        <span className="ml-auto text-[11px] text-muted-foreground">{arrow}</span>
+        <span className="ml-auto text-[12px] text-muted-foreground">{arrow}</span>
       </div>
       <dl className="mt-2 space-y-1">
         {rows.map(([k, v]) => (
@@ -247,15 +247,15 @@ function Branch({ label, tone, share, arrow, rows, note }) {
           </div>
         ))}
       </dl>
-      <p className="mt-2 text-[11.5px] leading-snug text-muted-foreground">{note}</p>
+      <p className="mt-2 text-[12px] leading-snug text-muted-foreground">{note}</p>
     </div>
   )
 }
 
 function Cell({ label, value, tone }) {
   return (
-    <div className="rounded-lg border border-border/60 bg-background/50 px-2.5 py-1.5">
-      <div className="text-[10.5px] uppercase tracking-wide text-muted-foreground">{label}</div>
+    <div className="rounded-lg border border-border bg-background/80 px-2.5 py-1.5">
+      <div className="text-[12px] uppercase tracking-wide text-muted-foreground">{label}</div>
       <div className={cn("mt-0.5 font-mono text-[14px] tabular-nums", tone)}>{value}</div>
     </div>
   )
@@ -276,7 +276,7 @@ export function TrafficSource({ frame, status }) {
       )}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+        <span className="text-[12px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
           Traffic source
         </span>
         <Pill tone={simulated ? "warn" : "good"}>
@@ -287,12 +287,12 @@ export function TrafficSource({ frame, status }) {
               : "live applications"}
         </Pill>
         {simulated && (
-          <span className="font-mono text-[11.5px] text-muted-foreground">
+          <span className="font-mono text-[12px] text-muted-foreground">
             scenario: {sim.scenario ?? "—"}
           </span>
         )}
       </div>
-      <p className="mt-1.5 text-[12.5px] leading-snug text-muted-foreground">
+      <p className="mt-1.5 text-[13.5px] leading-snug text-muted-foreground">
         {simulated ? (
           <>
             No external application is connected. The engine's own workload generator is
@@ -300,10 +300,10 @@ export function TrafficSource({ frame, status }) {
             rebuild costs, from a fixed seed so every run repeats exactly. Every number on
             this page is computed from that stream, not sampled from production. To drive it
             with the real Python services instead, run{" "}
-            <code className="rounded bg-muted/60 px-1 font-mono text-[11px]">
+            <code className="rounded bg-muted/60 px-1 font-mono text-[12px]">
               python -m driver.run_universe
             </code>{" "}
-            from <code className="font-mono text-[11px]">apps/</code>.
+            from <code className="font-mono text-[12px]">apps/</code>.
           </>
         ) : (
           <>The engine is idle. It only holds what connected applications put into it.</>
