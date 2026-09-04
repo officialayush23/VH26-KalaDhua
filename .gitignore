@@ -73,13 +73,3 @@ Thumbs.db
 *.swp
 *.swo
 *~
-
-# session transfer leftovers
-_incoming_src.tgz
-_to_delete/
-_fe.tgz
-
-# trained model bundles are pulled from Supabase, not committed
-engine/models/
-
-# local editor lock files

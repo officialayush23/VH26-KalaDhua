@@ -1,10 +1,18 @@
 //! Small, cheap estimators that run on every access.
+//!
+//! Nothing here allocates during steady state and nothing here is allowed to be more than
+//! a few nanoseconds, because these are the only structures the hot path touches.
 
 use crate::types::KeyId;
 
 const LN2: f64 = std::f64::consts::LN_2;
 
 /// Exponentially decayed access counter.
+///
+/// Reads decay the counter to *now* and return it; folding an access in is a separate
+/// step. Keeping those two operations separate is what lets the feature builder emit a
+/// value that reflects strictly prior accesses — the training pipeline does the same, and
+/// getting this order wrong is the single easiest way to leak the present into a feature.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecayCounter {
     value: f64,
@@ -39,6 +47,11 @@ impl DecayCounter {
 }
 
 /// Count-min sketch with 4-bit counters and periodic halving.
+///
+/// This is the admission filter's memory. Four bits per counter keeps a sketch for
+/// hundreds of thousands of keys inside a few hundred kilobytes; the halving pass is what
+/// stops a key that was popular an hour ago from holding a slot forever, which is exactly
+/// the failure mode that makes plain LFU collapse under a popularity shift.
 #[derive(Debug, Clone)]
 pub struct CountMinSketch {
     /// Packed 4-bit counters, two per byte, `depth` rows of `width` counters.
@@ -155,6 +168,11 @@ impl CountMinSketch {
 }
 
 /// Streaming quantile estimator using the pinball (quantile-loss) gradient step.
+///
+/// A per-group histogram would be exact, but the engine tracks quantiles for every
+/// (application, object_type) pair and must survive on the hot path. The training pipeline
+/// implements the identical update, so the `cost_variance_ratio` feature means the same
+/// thing offline and online.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QuantilePair {
     pub p50: f64,
