@@ -1,0 +1,28 @@
+[package]
+name = "aura-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AURA HTTP and WebSocket server, live engine and benchmark harness"
+
+[[bin]]
+name = "aura"
+path = "src/main.rs"
+
+[dependencies]
+aura-core.workspace = true
+aura-sim.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+ahash.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tower-http = { version = "0.5", features = ["cors", "set-header"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
