@@ -22,6 +22,7 @@ const MODELS_TABLE: &str = "aura_models";
 const RUNS_TABLE: &str = "aura_benchmark_runs";
 const RESULTS_TABLE: &str = "aura_benchmark_results";
 const EVENTS_TABLE: &str = "aura_events";
+const AUDIT_TABLE: &str = "aura_audit_log";
 const MODEL_BUCKET: &str = "aura-models";
 
 #[derive(Debug, Clone)]
@@ -200,6 +201,32 @@ impl Supabase {
 
         tracing::info!(run_id, rows = payload.len(), "published benchmark to supabase");
         Ok(())
+    }
+
+    /// Ship a batch of audit entries so the explanation of what the cache did outlives the
+    /// process that made the decisions.
+    ///
+    /// The in-memory log is a ring buffer a few hundred entries deep — enough to answer
+    /// "what just happened", useless for "why did we serve a wrong price on Tuesday". This
+    /// is the durable half. Failure is the caller's problem to requeue, which is why the
+    /// count that was accepted comes back rather than a bare unit.
+    pub async fn push_audit(&self, entries: &[Value]) -> anyhow::Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let res = self
+            .req(self.client.post(self.rest(AUDIT_TABLE)))
+            .json(entries)
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "audit insert failed: {} {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            );
+        }
+        Ok(entries.len())
     }
 
     pub async fn push_event(&self, kind: &str, detail: Value) -> anyhow::Result<()> {

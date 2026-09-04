@@ -4,9 +4,10 @@ use aura_core::types::KeyId;
 use aura_sim::{Generator, Scenario};
 use serde::Serialize;
 
+use aura_core::policies::{self, CachePolicy, Request as PolicyRequest};
+
 use crate::capacity::CapacityController;
 use crate::engine::Engine;
-use crate::policy::Policy;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchRow {
@@ -19,6 +20,10 @@ pub struct BenchRow {
     pub byte_hit_rate: f64,
     pub p95_latency_ms: f64,
     pub backend_requests: u64,
+    /// Reads answered from a value that was past its TTL. A policy with a working refresh
+    /// controller should drive this to nearly zero; one without a refresh controller cannot
+    /// influence it at all, which is the point of reporting it separately from the hit rate.
+    pub stale_hits: u64,
     pub total_cost_usd: f64,
     pub regen_cost_usd: f64,
     pub sla_penalty_usd: f64,
@@ -62,13 +67,12 @@ pub fn run(
     let mut rows = Vec::new();
     for name in policies {
         let row = match name.as_str() {
-            "aura" => run_aura(cfg, &stream, capacity_bytes, seed),
-            other => match parse_policy(other) {
-                Some(p) => run_classical(cfg, &stream, capacity_bytes, p),
-                None => continue,
-            },
+            "aura" => Some(run_aura(cfg, &stream, capacity_bytes, seed)),
+            other => run_baseline(cfg, &stream, capacity_bytes, other),
         };
-        rows.push(row);
+        if let Some(row) = row {
+            rows.push(row);
+        }
     }
 
     let belady = run_belady(cfg, &stream, capacity_bytes);
@@ -110,10 +114,6 @@ pub fn run(
         improvement_vs: serde_json::Value::Object(improvement),
         finished: true,
     }
-}
-
-fn parse_policy(s: &str) -> Option<Policy> {
-    Policy::ALL.iter().copied().find(|p| p.as_str() == s)
 }
 
 fn run_aura(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, seed: u64) -> BenchRow {
@@ -182,6 +182,7 @@ fn run_aura(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, seed: u64
         byte_hit_rate: round4(hit_bytes as f64 / total_bytes.max(1) as f64),
         p95_latency_ms: round2(quantile(&mut latencies, 0.95)),
         backend_requests: eng.store.l2_stats.misses,
+        stale_hits: eng.stale_serves,
         total_cost_usd: round4(eng.ledger.backend_usd + eng.ledger.sla_penalty_usd + holding),
         regen_cost_usd: round4(eng.ledger.backend_usd),
         sla_penalty_usd: round4(eng.ledger.sla_penalty_usd),
@@ -190,33 +191,62 @@ fn run_aura(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, seed: u64
     }
 }
 
-fn run_classical(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, policy: Policy) -> BenchRow {
-    let mut resident: AHashMap<KeyId, (u64, f64, f64, f64)> = AHashMap::new();
-    let mut used = 0u64;
-    let (mut hits, mut misses) = (0u64, 0u64);
+/// Replay the stream through one real baseline implementation.
+///
+/// The point of going through [`aura_core::policies`] rather than re-deriving each policy
+/// with a score function here is that W-TinyLFU, S3-FIFO and SIEVE are *defined* by their
+/// structure — an admission filter, three queues, a scanning hand — not by a ranking
+/// expression. A benchmark that reduces them to `rank(size, age, freq, cost)` is not
+/// beating them, it is beating a caricature of them, and a result obtained that way says
+/// nothing. Each policy here owns its own machinery and its own byte accounting, and the
+/// metadata it carries to do so is charged back in `memory_overhead_bytes` so a policy
+/// cannot buy its hit rate with bookkeeping the comparison never prices.
+fn run_baseline(
+    cfg: &Config,
+    stream: &[aura_sim::Request],
+    capacity: u64,
+    name: &str,
+) -> Option<BenchRow> {
+    let mut policy = policies::build(name, capacity)?;
+
+    let (mut hits, mut misses, mut stale) = (0u64, 0u64, 0u64);
     let (mut hit_bytes, mut total_bytes) = (0u64, 0u64);
     let mut cost = 0.0f64;
     let mut penalty = 0.0f64;
-    let mut latencies = Vec::new();
+    let mut latencies = Vec::with_capacity(stream.len());
     let mut byte_ms = 0.0f64;
     let mut last_ts = stream.first().map(|r| r.ts_ms).unwrap_or(0.0);
 
     for r in stream {
-        let size = r.context.size_bytes;
-        total_bytes += size;
-        byte_ms += used as f64 * (r.ts_ms - last_ts).max(0.0);
+        total_bytes += r.context.size_bytes;
+        // Occupancy integrated over time is what memory actually costs. Charging the final
+        // size would let a policy hold a huge pool all run and pay for the instant it
+        // happened to end on.
+        byte_ms += policy.used_bytes() as f64 * (r.ts_ms - last_ts).max(0.0);
         last_ts = r.ts_ms;
-        let c = cfg.pricing.regen_cost_usd(&r.context.regen);
-        if let Some(slot) = resident.get_mut(&r.key_id) {
+
+        let req = PolicyRequest {
+            ts_ms: r.ts_ms,
+            key: r.key_id,
+            size_bytes: r.context.size_bytes,
+            ttl_ms: r.context.ttl_ms.unwrap_or(0.0),
+            regen: r.context.regen,
+            application: &r.context.application,
+            object_type: &r.context.object_type,
+            sla: r.context.sla_class,
+        };
+        let result = policy.access(&req);
+        if result.stale {
+            stale += 1;
+        }
+        if result.hit {
             hits += 1;
-            hit_bytes += size;
-            slot.1 = r.ts_ms;
-            slot.3 += 1.0;
+            hit_bytes += r.context.size_bytes;
             latencies.push(0.4);
             continue;
         }
         misses += 1;
-        cost += c;
+        cost += cfg.pricing.regen_cost_usd(&r.context.regen);
         latencies.push(r.regen_latency_ms);
         if r.regen_latency_ms > cfg.pricing.slo_p95_ms {
             penalty += cfg.pricing.sla_penalty_usd(
@@ -224,37 +254,17 @@ fn run_classical(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, poli
                 r.context.sla_class.penalty_weight(),
             );
         }
-        if size > capacity {
-            continue;
-        }
-        while used + size > capacity {
-            let victim = resident
-                .iter()
-                .map(|(k, v)| (*k, rank(policy, v, r.ts_ms)))
-                .fold(None::<(KeyId, f64)>, |acc, cur| match acc {
-                    Some(a) if a.1 <= cur.1 => Some(a),
-                    _ => Some(cur),
-                });
-            match victim {
-                Some((k, _)) => {
-                    if let Some(v) = resident.remove(&k) {
-                        used = used.saturating_sub(v.0);
-                    }
-                }
-                None => break,
-            }
-        }
-        resident.insert(r.key_id, (size, r.ts_ms, c, 1.0));
-        used += size;
     }
 
     let span_ms = (last_ts - stream.first().map(|r| r.ts_ms).unwrap_or(0.0)).max(1.0);
     let mean_resident = (byte_ms / span_ms) as u64;
     let holding = cfg.pricing.holding_cost_usd(mean_resident as f64, span_ms);
 
-    BenchRow {
-        policy: policy.as_str().into(),
+    Some(BenchRow {
+        policy: policy.name().to_string(),
         capacity_start_bytes: capacity,
+        // A baseline has no way to resize itself. That is not an oversight in the
+        // comparison, it is the gap the adaptive controller exists to fill.
         capacity_end_bytes: capacity,
         mean_resident_bytes: mean_resident,
         holding_cost_usd: round4(holding),
@@ -262,12 +272,13 @@ fn run_classical(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, poli
         byte_hit_rate: round4(hit_bytes as f64 / total_bytes.max(1) as f64),
         p95_latency_ms: round2(quantile(&mut latencies, 0.95)),
         backend_requests: misses,
+        stale_hits: stale,
         total_cost_usd: round4(cost + penalty + holding),
         regen_cost_usd: round4(cost),
         sla_penalty_usd: round4(penalty),
         decision_overhead_us_p50: 0.2,
-        memory_overhead_bytes: (resident.len() as u64) * 48,
-    }
+        memory_overhead_bytes: policy.memory_overhead_bytes() as u64,
+    })
 }
 
 /// Belady needs the future, so it only exists offline. It is reported as the ceiling the
@@ -329,18 +340,6 @@ fn run_belady(cfg: &Config, stream: &[aura_sim::Request], capacity: u64) -> Bela
     BeladyBound {
         object_hit_rate: round4(hits as f64 / (hits + misses).max(1) as f64),
         total_cost_usd: round4(cost),
-    }
-}
-
-fn rank(policy: Policy, v: &(u64, f64, f64, f64), now_ms: f64) -> f64 {
-    let (size, last_ms, cost, freq) = *v;
-    match policy {
-        Policy::Lru => last_ms,
-        Policy::Lfu => freq,
-        Policy::Gdsf => (freq * cost.max(1e-12)) / (size as f64).max(1.0) * 1e9,
-        Policy::TinyLfu => freq * 0.8 + last_ms / 1e6,
-        Policy::CostAware => cost.max(1e-12) / (size as f64).max(1.0) * 1e9,
-        Policy::TrendAware => freq / (1.0 + (now_ms - last_ms) / 1000.0),
     }
 }
 

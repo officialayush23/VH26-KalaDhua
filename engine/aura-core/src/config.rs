@@ -147,6 +147,15 @@ pub struct EngineConfig {
     /// Extra weight on the tail of the regeneration-latency distribution. Objects whose
     /// misses are *occasionally* catastrophic are worth more than their median suggests.
     pub tail_risk_lambda: f64,
+    /// Fraction of the TTL at which an object stops being fresh and becomes serve-once
+    /// stale. 0.8 means the last fifth of the lifetime is the refresh-ahead window: readers
+    /// still get an answer immediately while the rebuild happens behind them, which is what
+    /// stops a popular key turning into a thundering herd the instant it expires.
+    pub soft_ttl_fraction: f64,
+    /// How long one caller may hold the rebuild lease for a missing key before another is
+    /// allowed to take it. Long enough to cover an honest rebuild, short enough that a
+    /// crashed caller cannot wedge the key.
+    pub rebuild_lease_ms: f64,
 }
 
 impl Default for EngineConfig {
@@ -159,6 +168,8 @@ impl Default for EngineConfig {
             ml_confidence_floor: 0.20,
             horizon_weights: [0.5, 0.35, 0.15],
             tail_risk_lambda: 0.35,
+            soft_ttl_fraction: 0.8,
+            rebuild_lease_ms: 5_000.0,
         }
     }
 }

@@ -9,6 +9,9 @@ use aura_core::types::{Action, CostVector, Decision, KeyId, ObjectContext};
 use serde::Serialize;
 
 use crate::audit::{self, AuditKind, AuditLog, Fact, Severity};
+use crate::consistency::{
+    Consistency, ConsistencyStats, Freshness, InvalidationMode, InvalidationResult, Removal,
+};
 use crate::feedback::{Journal, JournalStats, TrainingRow};
 use crate::policy::{round4, Bandit, Policy, Regime, WorkloadFeatures};
 use crate::predictor::Predictor;
@@ -201,6 +204,10 @@ pub struct Engine {
     pub journal: Journal,
     /// What the cache did, in words. See `audit.rs`.
     pub audit: AuditLog,
+    /// Dependency tags, namespace versions and the freshness rule. See `consistency.rs`.
+    /// Checked *before* value on every read: being fast is an optimisation, being right
+    /// is not.
+    pub consistency: Consistency,
     pub ledger: CostLedger,
     pub shadows: Vec<Shadow>,
     pub apps: AHashMap<String, AppStats>,
@@ -215,7 +222,18 @@ pub struct Engine {
     pub requests: u64,
     pub refreshes: u64,
     pub rejections: u64,
+    /// Reads answered from a value that was past its soft threshold. Each one is a request
+    /// that did *not* wait for a rebuild, and each one is also a small admission of
+    /// staleness, so it is counted rather than hidden inside the hit rate.
+    pub stale_serves: u64,
+    /// Objects whose rebuild is owed but not yet done. Draining this is what makes refresh
+    /// real rather than a clock reset.
+    pub refresh_queue: VecDeque<KeyId>,
     pub decision_overhead_us: VecDeque<f64>,
+    /// The policy mixture at the last audit, so a shift can be described as a change
+    /// rather than a level.
+    last_mixture: [f64; 6],
+    last_pressure_note_ms: f64,
     rng: Rng,
     recent_keys: VecDeque<KeyId>,
     seen_keys: AHashMap<KeyId, f64>,
@@ -238,6 +256,7 @@ impl Engine {
         let signals = SignalBuilder::new(2_000, cfg.features.quantile_lr);
         let predictor = Predictor::heuristic(cfg.predictor.online_lr);
         let bandit = Bandit::new(cfg.bandit.exploration, seed ^ 0x9E37);
+        let consistency = Consistency::new(cfg.engine.soft_ttl_fraction);
         let shadows = [Policy::Lru, Policy::Lfu, Policy::Gdsf]
             .iter()
             .map(|p| Shadow::new(*p, capacity))
@@ -251,6 +270,7 @@ impl Engine {
             bandit,
             journal: Journal::new(),
             audit: AuditLog::default(),
+            consistency,
             ledger: CostLedger::default(),
             shadows,
             apps: AHashMap::new(),
@@ -265,7 +285,11 @@ impl Engine {
             requests: 0,
             refreshes: 0,
             rejections: 0,
+            stale_serves: 0,
+            refresh_queue: VecDeque::with_capacity(256),
             decision_overhead_us: VecDeque::with_capacity(2_048),
+            last_mixture: [1.0 / 6.0; 6],
+            last_pressure_note_ms: -1e12,
             rng: Rng::seed_from_u64(seed),
             recent_keys: VecDeque::with_capacity(8_192),
             seen_keys: AHashMap::new(),
@@ -287,7 +311,7 @@ impl Engine {
             s.set_capacity(bytes);
         }
         self.push_event(
-            "ScaleUp",
+            if bytes >= before { "ScaleUp" } else { "ScaleDown" },
             &format!("{} -> {}", human_bytes(before), human_bytes(bytes)),
         );
         self.enforce_capacity();
@@ -307,13 +331,56 @@ impl Engine {
         let l1_seen = self.store.touch_l1(key, now_ms);
         self.store.l1_stats.record(l1_seen, 0);
 
-        let expired = self
+        // Validity before value. Everything below this point is an optimisation; this is
+        // the part that is not negotiable, so it runs first and it does not consult the
+        // model, the bandit or the economics. A cache that serves a price of $40 after the
+        // database says $20 is not a fast cache, it is a wrong one.
+        let snapshot = self
             .store
             .get(key)
-            .map(|e| e.expired(now_ms))
-            .unwrap_or(false);
-        if expired {
-            self.store.remove(key);
+            .map(|e| (e.inserted_ms, e.ttl_ms, e.size_bytes, e.application.clone()));
+        if let Some((inserted_ms, ttl_ms, size_bytes, app)) = snapshot {
+            match self.consistency.freshness(key, inserted_ms, ttl_ms, now_ms) {
+                Freshness::Expired => {
+                    self.drop_key(key, Removal::Expired, 0.0, 0.0);
+                }
+                Freshness::Stale => {
+                    // Serve it once and rebuild behind the reader. Making this request wait
+                    // would be correct and slow; making the *next* thousand requests wait,
+                    // which is what expiring a popular key does, is neither.
+                    self.stale_serves += 1;
+                    self.consistency.note_stale_serve();
+                    self.queue_refresh(key);
+                    if self.stale_serves % 64 == 1 {
+                        let remaining = if ttl_ms > 0.0 {
+                            (1.0 - (now_ms - inserted_ms) / ttl_ms).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let name = format!("{app}:{key}");
+                        let message = format!(
+                            "Served {name} while it was stale — {} of its lifetime left, and a \
+                             rebuild is queued. The reader got an answer immediately instead of \
+                             paying for the rebuild, and the herd behind it will get the new value.",
+                            audit::percent(remaining)
+                        );
+                        self.audit.record(
+                            self.now_ms,
+                            AuditKind::Refresh,
+                            Severity::Info,
+                            name,
+                            &app,
+                            message,
+                            vec![
+                                Fact::new("size", audit::bytes(size_bytes)),
+                                Fact::new("ttl_remaining", audit::percent(remaining)),
+                            ],
+                            0.0,
+                        );
+                    }
+                }
+                Freshness::Fresh => {}
+            }
         }
 
         let entry = match self.store.entry_mut(key) {
@@ -518,6 +585,11 @@ impl Engine {
                     ctx.size_bytes as f64,
                     ctx.ttl_ms.unwrap_or(60_000.0).min(600_000.0),
                 );
+                // The object is now on the hook for whatever it was derived from, and any
+                // stale mark it was carrying is settled: this *is* the rebuild.
+                self.consistency.register(key, &ctx.depends_on);
+                self.consistency.mark_rebuilt(key);
+                self.refresh_queue.retain(|k| *k != key);
                 Decision::new(Action::Admit, "density_above_threshold")
             } else {
                 self.rejections += 1;
@@ -589,7 +661,7 @@ impl Engine {
         if self.store.fits(needed) {
             return evicted;
         }
-        self.store.sweep_expired(now_ms);
+        self.sweep_expired(now_ms);
         let sample_n = self.cfg.engine.candidate_sample.max(4);
         let mut guard = 0;
         while !self.store.fits(needed) && guard < 4_096 {
@@ -608,13 +680,98 @@ impl Engine {
             }
             match worst {
                 Some((k, d)) if d <= incoming_density * 1.05 => {
-                    self.store.evict(k);
+                    self.drop_key(k, Removal::Evicted, d, incoming_density);
                     evicted.push(k);
                 }
                 _ => break,
             }
         }
         evicted
+    }
+
+    /// Remove one object and account for *why*.
+    ///
+    /// Eviction, invalidation and expiry are three different events and the telemetry must
+    /// not merge them: eviction means the cache was short of space, invalidation means it
+    /// was wrong, expiry means time passed. A dashboard showing one number for all three
+    /// hides the only one of the three that indicates a bug.
+    fn drop_key(&mut self, key: KeyId, reason: Removal, density: f64, incoming_density: f64) {
+        let removed = match reason {
+            Removal::Evicted => self.store.evict(key),
+            _ => self.store.remove(key),
+        };
+        let Some(e) = removed else { return };
+        if reason == Removal::Expired {
+            self.store.expirations += 1;
+        }
+        self.consistency.forget(key);
+        self.consistency.note_removal(reason);
+        self.refresh_queue.retain(|k| *k != key);
+
+        let cost = self.cfg.pricing.regen_cost_usd(&e.regen);
+        let name = format!("{}:{}", e.application, key);
+        let facts = vec![
+            Fact::new("size", audit::bytes(e.size_bytes)),
+            Fact::new("hits_while_resident", e.hits.to_string()),
+            Fact::new("rebuild_cost", audit::usd(cost)),
+            Fact::new("reason", reason.as_str()),
+        ];
+        let (kind, severity, message) = match reason {
+            Removal::Evicted => (
+                AuditKind::Evict,
+                // Throwing away something expensive is worth a line even when routine
+                // evictions are being sampled away.
+                if cost > 0.001 { Severity::Notice } else { Severity::Info },
+                audit::say::evicted(&name, e.size_bytes, density, incoming_density, cost),
+            ),
+            Removal::Expired => (
+                AuditKind::Expire,
+                Severity::Info,
+                format!(
+                    "Dropped {name}: its {} lifetime ran out before anyone asked for it again. \
+                     It was served {} time{} while resident.",
+                    audit::ms(e.ttl_ms),
+                    e.hits,
+                    if e.hits == 1 { "" } else { "s" }
+                ),
+            ),
+            Removal::Invalidated => (
+                AuditKind::Invalidate,
+                Severity::Notice,
+                format!("Dropped {name}: the data it was built from changed."),
+            ),
+        };
+        self.audit.record(
+            self.now_ms, kind, severity, name, &e.application, message, facts, -cost,
+        );
+    }
+
+    /// Drop everything past its hard TTL, forgetting its dependencies as it goes.
+    ///
+    /// This goes through [`Engine::drop_key`] rather than `Store::sweep_expired` so that an
+    /// expiry cannot leave a dangling tag behind. A tag pointing at a key that no longer
+    /// exists is not merely untidy: the next invalidation matches it, reports work it did
+    /// not do, and the real object built from that row survives.
+    pub fn sweep_expired(&mut self, now_ms: f64) -> usize {
+        let dead: Vec<KeyId> = self
+            .store
+            .keys()
+            .iter()
+            .copied()
+            .filter(|k| self.store.get(*k).map(|e| e.expired(now_ms)).unwrap_or(false))
+            .collect();
+        let n = dead.len();
+        for k in dead {
+            self.drop_key(k, Removal::Expired, 0.0, 0.0);
+        }
+        n
+    }
+
+    fn queue_refresh(&mut self, key: KeyId) {
+        if self.refresh_queue.len() >= 4_096 || self.refresh_queue.contains(&key) {
+            return;
+        }
+        self.refresh_queue.push_back(key);
     }
 
     /// Value density of an object already resident, on the *same scale* as
@@ -676,6 +833,29 @@ impl Engine {
         self.value_density(&f, reuse, e.size_bytes, cost) * e.ttl_remaining_frac(now_ms).max(0.05)
     }
 
+    /// The reuse estimate for a resident object, without recording an access.
+    ///
+    /// `peek` rather than `transform` matters: scoring an object must never look like the
+    /// object was requested, or the act of considering something for eviction would make it
+    /// appear popular and save it.
+    pub fn reuse_peek(&self, key: KeyId, now_ms: f64) -> Option<[f64; 3]> {
+        let e = self.store.get(key)?;
+        let ambient = AmbientState {
+            cache_pressure: self.store.pressure(),
+            ttl_remaining_frac: e.ttl_remaining_frac(now_ms),
+        };
+        let f = self.features.peek(
+            key,
+            now_ms,
+            &e.application,
+            &e.object_type,
+            e.size_bytes,
+            &e.regen,
+            ambient,
+        );
+        Some(self.predictor.reuse_peek(&f))
+    }
+
     /// Density of the weakest resident object a sample can find.
     fn victim_bar(&mut self, incoming_bytes: u64, now_ms: f64) -> f64 {
         if self.store.fits(incoming_bytes) {
@@ -713,16 +893,22 @@ impl Engine {
                 }
             }
             match worst {
-                Some((k, _)) => {
-                    self.store.evict(k);
+                Some((k, d)) => {
+                    self.drop_key(k, Removal::Evicted, d, 0.0);
                 }
                 None => break,
             }
         }
     }
 
-    /// Objects close to expiry that are still valuable are rebuilt before anyone asks, so
-    /// the expiry is never paid for on a user request.
+    /// Objects close to expiry that are still valuable are queued for rebuild before anyone
+    /// asks, so the expiry is never paid for on a user request.
+    ///
+    /// This only *nominates*. It deliberately does not touch `inserted_ms`: resetting the
+    /// clock on bytes nobody rebuilt is the one thing a refresh controller must never do,
+    /// because it turns a stale object into a permanently fresh-looking stale object. The
+    /// rebuild itself happens in [`Engine::rebuild`], or in the application that drains
+    /// this queue over `GET /v1/refresh/queue`.
     pub fn refresh_candidates(&mut self, limit: usize) -> Vec<KeyId> {
         let now = self.now_ms;
         let thr = self.cfg.engine.refresh_ttl_threshold;
@@ -739,10 +925,182 @@ impl Engine {
             })
             .map(|k| (k, self.resident_density(k, now)))
             .collect();
+        // Most valuable first: if only some of them can be rebuilt this tick, the ones
+        // whose expiry would hurt most are the ones that get rebuilt.
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out.truncate(limit);
-        self.refreshes += out.len() as u64;
-        out.into_iter().map(|(k, _)| k).collect()
+        let keys: Vec<KeyId> = out.into_iter().map(|(k, _)| k).collect();
+        for k in &keys {
+            self.queue_refresh(*k);
+        }
+        keys
+    }
+
+    /// What the cache still owes a rebuild on, oldest first, with enough context for the
+    /// application to actually rebuild it.
+    ///
+    /// This is the plug-and-play half of refresh: the engine knows *which* objects are
+    /// about to go bad and what they cost, but only the application knows how to make one,
+    /// so the engine publishes the list and the application PUTs the new value back.
+    pub fn refresh_backlog(&self, limit: usize) -> Vec<(KeyId, ObjectContext, f64)> {
+        self.refresh_queue
+            .iter()
+            .take(limit)
+            .filter_map(|k| {
+                let remaining = self.store.get(*k)?.ttl_remaining_frac(self.now_ms);
+                Some((*k, self.store.context_of(*k)?, remaining))
+            })
+            .collect()
+    }
+
+    /// Rebuild an object through its origin and pay for it.
+    ///
+    /// The cost is charged to the backend ledger because a refresh is a real origin call:
+    /// pre-emptive rebuilding is cheaper than an expiry storm, not free, and a cache that
+    /// reported it as free would recommend refreshing everything constantly.
+    ///
+    /// `value` is what the origin returned. Passing `None` means the caller only wants the
+    /// bookkeeping — used by the simulator, where the bytes are accounted rather than held.
+    pub fn rebuild(&mut self, key: KeyId, value: Option<serde_json::Value>, now_ms: f64) -> bool {
+        self.now_ms = now_ms.max(self.now_ms);
+        let snapshot = self.store.get(key).map(|e| {
+            (
+                e.application.clone(),
+                e.size_bytes,
+                e.ttl_ms,
+                e.regen,
+                e.hits,
+                e.ttl_remaining_frac(now_ms),
+            )
+        });
+        let Some((app, size, ttl, regen, hits, remaining_before)) = snapshot else {
+            self.refresh_queue.retain(|k| *k != key);
+            return false;
+        };
+        let cost = self.cfg.pricing.regen_cost_usd(&regen);
+
+        self.ledger.backend_usd += cost;
+        {
+            let st = self.apps.entry(app.clone()).or_default();
+            st.cost_usd += cost;
+            st.regen_count += 1;
+            st.regen_ms_total += regen.cpu_ms + regen.gpu_ms + regen.db_ms;
+        }
+
+        if let Some(entry) = self.store.entry_mut(key) {
+            if let Some(v) = value {
+                entry.value = v;
+            }
+            entry.inserted_ms = now_ms;
+        }
+        self.consistency.mark_rebuilt(key);
+        self.refresh_queue.retain(|k| *k != key);
+        self.refreshes += 1;
+
+        let reuse = self.reuse_peek(key, now_ms).map(|r| r[1]).unwrap_or(0.0);
+        let name = format!("{app}:{key}");
+        // One in eight, because a busy cache refreshes constantly and the interesting ones
+        // are the expensive ones, which the severity below keeps regardless.
+        if self.refreshes % 8 == 1 || cost > 0.001 {
+            let message = audit::say::refreshed(&name, remaining_before, reuse.min(1.0));
+            self.audit.record(
+                self.now_ms,
+                AuditKind::Refresh,
+                if cost > 0.001 { Severity::Notice } else { Severity::Info },
+                name,
+                &app,
+                message,
+                vec![
+                    Fact::new("size", audit::bytes(size)),
+                    Fact::new("ttl", audit::ms(ttl)),
+                    Fact::new("rebuild_cost", audit::usd(cost)),
+                    Fact::new("hits_before_refresh", hits.to_string()),
+                ],
+                -cost,
+            );
+        }
+        true
+    }
+
+    // ------------------------------------------------------------------ correctness
+
+    /// Invalidate everything downstream of these tags.
+    ///
+    /// The whole answer to "the price changed in the database and the cache did not
+    /// notice": the write emits one tag, the dependency index turns it into every affected
+    /// key, and nothing needed to know in advance which rollups and rankings were built
+    /// from that row.
+    pub fn invalidate(
+        &mut self,
+        tags: &[String],
+        mode: InvalidationMode,
+        source: &str,
+        now_ms: f64,
+    ) -> InvalidationResult {
+        self.now_ms = now_ms.max(self.now_ms);
+        let at = self.now_ms;
+        let result = self.consistency.invalidate(tags, mode, source, at);
+
+        let mut freed = 0u64;
+        for k in &result.keys_hard {
+            if let Some(e) = self.store.remove(*k) {
+                freed += e.size_bytes;
+            }
+            self.refresh_queue.retain(|q| q != k);
+        }
+        // A soft invalidation is a promise to rebuild, so the rebuild is queued rather
+        // than left to whoever happens to read next.
+        for k in &result.keys_soft {
+            self.queue_refresh(*k);
+        }
+
+        let hard = mode == InvalidationMode::Hard;
+        let affected = if hard { result.keys_hard.len() } else { result.keys_soft.len() };
+        let tag_label = tags.join(", ");
+        self.audit.record(
+            self.now_ms,
+            AuditKind::Invalidate,
+            // Never sampled away. An invalidation is a correctness event, and the one log
+            // line a person actually goes looking for after a bad read.
+            Severity::Notice,
+            tag_label.clone(),
+            source,
+            audit::say::invalidated(&tag_label, affected, hard, source),
+            vec![
+                Fact::new("mode", if hard { "hard" } else { "soft" }),
+                Fact::new("keys", affected.to_string()),
+                Fact::new("bytes_freed", audit::bytes(freed)),
+            ],
+            0.0,
+        );
+        self.push_event(
+            "Invalidate",
+            &format!("{tag_label}: {affected} object(s), {}", if hard { "hard" } else { "soft" }),
+        );
+        result
+    }
+
+    /// Retire a whole generation without deleting anything.
+    pub fn bump_version(&mut self, namespace: &str, now_ms: f64) -> u64 {
+        self.now_ms = now_ms.max(self.now_ms);
+        let at = self.now_ms;
+        let version = self.consistency.bump_version(namespace, at);
+        self.audit.record(
+            self.now_ms,
+            AuditKind::VersionBump,
+            Severity::Notice,
+            namespace,
+            "engine",
+            audit::say::version_bumped(namespace, version),
+            vec![Fact::new("version", version.to_string())],
+            0.0,
+        );
+        self.push_event("VersionBump", &format!("{namespace} -> v{version}"));
+        version
+    }
+
+    pub fn consistency_stats(&self) -> ConsistencyStats {
+        self.consistency.stats()
     }
 
     fn record_explain(
@@ -903,8 +1261,9 @@ impl Engine {
         rent_hr: f64,
         roi: f64,
         threshold: f64,
+        applied: bool,
     ) {
-        let (kind, message) = if to == from {
+        let (kind, message) = if !applied {
             (AuditKind::ScaleHold, audit::say::held(from, to, roi, threshold))
         } else if to > from {
             (AuditKind::ScaleUp, audit::say::scaled(from, to, delta_hit, savings_hr, rent_hr))
@@ -1079,13 +1438,86 @@ impl Engine {
         };
         let (regime, conf) = self.workload.classify();
         if regime != self.regime {
-            self.push_event("PolicyShift", &format!("{} -> {}", self.regime.as_str(), regime.as_str()));
+            let from = self.regime.as_str();
+            self.push_event("PolicyShift", &format!("{} -> {}", from, regime.as_str()));
+            self.audit_regime(from, regime.as_str(), conf);
         }
         self.regime = regime;
         self.regime_confidence = conf;
         self.bandit.decay(0.995);
+        self.audit_policy_shift();
+        self.audit_pressure();
         self.window_requests = 0;
         self.novel_in_window = 0;
+    }
+
+    /// Say so when the strategy being rewarded has actually moved.
+    ///
+    /// Only a change of five points or more is reported. The mixture drifts by a fraction
+    /// of a percent every tick, and a log that says so every time is a log nobody reads.
+    fn audit_policy_shift(&mut self) {
+        let now = self.bandit.mixture();
+        let mut worst: Option<(usize, f64)> = None;
+        for i in 0..6 {
+            let delta = now[i] - self.last_mixture[i];
+            if worst.map(|w| delta.abs() > w.1.abs()).unwrap_or(true) {
+                worst = Some((i, delta));
+            }
+        }
+        let Some((i, delta)) = worst else { return };
+        if delta.abs() < 0.05 {
+            return;
+        }
+        let toward = Policy::ALL[i].as_str();
+        let because = format!(
+            "The workload looks like {} and that expert has been predicting reuse better than \
+             the others for the last few hundred settled decisions.",
+            self.regime.as_str()
+        );
+        let message = audit::say::policy_shifted(toward, self.last_mixture[i], now[i], &because);
+        self.audit.record(
+            self.now_ms,
+            AuditKind::PolicyShift,
+            Severity::Notice,
+            toward,
+            "engine",
+            message,
+            vec![
+                Fact::new("from", audit::percent(self.last_mixture[i])),
+                Fact::new("to", audit::percent(now[i])),
+                Fact::new("regime", self.regime.as_str()),
+            ],
+            0.0,
+        );
+        self.last_mixture = now;
+    }
+
+    /// A cache under pressure behaves differently, and a reader looking at a sudden drop in
+    /// hit rate deserves to be told that rather than left to infer it.
+    fn audit_pressure(&mut self) {
+        let pressure = self.store.pressure();
+        if pressure < 0.95 || self.now_ms - self.last_pressure_note_ms < 30_000.0 {
+            return;
+        }
+        self.last_pressure_note_ms = self.now_ms;
+        let elapsed_s = (self.now_ms / 1000.0).max(1.0);
+        let per_s = self.store.evictions as f64 / elapsed_s;
+        let (used, capacity) = (self.store.used_bytes(), self.store.capacity_bytes());
+        let message = audit::say::pressure(used, capacity, per_s);
+        self.audit.record(
+            self.now_ms,
+            AuditKind::Pressure,
+            Severity::Warning,
+            "capacity",
+            "engine",
+            message,
+            vec![
+                Fact::new("used", audit::bytes(used)),
+                Fact::new("capacity", audit::bytes(capacity)),
+                Fact::new("evictions_per_s", format!("{per_s:.0}")),
+            ],
+            0.0,
+        );
     }
 }
 
@@ -1098,4 +1530,175 @@ pub fn human_bytes(b: u64) -> String {
         i += 1;
     }
     format!("{v:.0} {}", U[i])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn engine(capacity_bytes: u64) -> Engine {
+        let mut cfg = Config::default();
+        cfg.cache.capacity_bytes = capacity_bytes;
+        Engine::new(cfg, 7)
+    }
+
+    fn ctx(app: &str, size: u64, tags: &[&str], ttl_ms: f64) -> ObjectContext {
+        let mut c = ObjectContext::new(app, "object", size).with_tags(tags);
+        if ttl_ms > 0.0 {
+            c = c.with_ttl(ttl_ms);
+        }
+        c
+    }
+
+    fn db_cost(ms: f64) -> CostVector {
+        CostVector { db_ms: ms, latency_ms: ms, ..Default::default() }
+    }
+
+    fn admit(e: &mut Engine, key: KeyId, tags: &[&str], ttl_ms: f64, at: f64) {
+        let c = ctx("analytics", 1_000, tags, ttl_ms);
+        let (d, _) = e.put(key, Value::Null, &c, db_cost(40.0), at);
+        assert_eq!(d.action, Action::Admit, "test setup failed to admit key {key}");
+    }
+
+    #[test]
+    fn one_row_change_invalidates_everything_derived_from_it_and_nothing_else() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &["row:product:7"], 0.0, 0.0);
+        admit(&mut e, 2, &["row:product:7", "table:orders"], 0.0, 1.0);
+        admit(&mut e, 3, &["row:product:9"], 0.0, 2.0);
+
+        let r = e.invalidate(&["row:product:7".into()], InvalidationMode::Hard, "postgres", 100.0);
+        assert_eq!(r.keys_hard.len(), 2);
+        assert!(e.get(1, "analytics", 101.0).is_none(), "a stale object survived the write");
+        assert!(e.get(2, "analytics", 101.0).is_none());
+        assert!(
+            e.get(3, "analytics", 101.0).is_some(),
+            "an object built from a different row was thrown away"
+        );
+    }
+
+    #[test]
+    fn eviction_invalidation_and_expiry_are_counted_as_three_different_things() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &["t"], 1_000.0, 0.0);
+        admit(&mut e, 2, &["t"], 0.0, 0.0);
+
+        // Expiry.
+        assert!(e.get(1, "analytics", 2_000.0).is_none());
+        // Invalidation.
+        e.invalidate(&["t".into()], InvalidationMode::Hard, "postgres", 2_100.0);
+        // Eviction: squeeze the pool until nothing fits.
+        admit(&mut e, 3, &[], 0.0, 2_200.0);
+        e.set_capacity(1);
+
+        let s = e.consistency_stats();
+        assert_eq!(s.expired, 1, "expiry was not counted as expiry");
+        assert_eq!(s.keys_invalidated, 1, "invalidation was not counted as invalidation");
+        assert!(s.evicted >= 1, "eviction was not counted as eviction");
+    }
+
+    #[test]
+    fn the_last_fifth_of_a_lifetime_is_served_stale_and_queues_a_rebuild() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &[], 1_000.0, 0.0);
+
+        // Comfortably fresh: nothing is queued.
+        assert!(e.get(1, "analytics", 400.0).is_some());
+        assert_eq!(e.stale_serves, 0);
+
+        // Past the soft threshold: the reader still gets an answer, and the rebuild is owed.
+        assert!(e.get(1, "analytics", 900.0).is_some(), "a stale-but-valid object was withheld");
+        assert_eq!(e.stale_serves, 1);
+        assert!(e.refresh_queue.contains(&1), "nothing was queued for rebuild");
+    }
+
+    #[test]
+    fn a_refresh_rebuilds_rather_than_resetting_the_clock() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &[], 1_000.0, 0.0);
+        let spent_before = e.ledger.backend_usd;
+
+        assert!(e.rebuild(1, Some(Value::String("fresh".into())), 900.0));
+
+        assert!(
+            e.ledger.backend_usd > spent_before,
+            "a refresh was recorded as free; it is an origin call and has to be paid for"
+        );
+        assert_eq!(e.refreshes, 1);
+        assert!(e.refresh_queue.is_empty());
+        let entry = e.get(1, "analytics", 1_200.0).expect("the rebuild should have extended the lifetime");
+        assert_eq!(entry.value, Value::String("fresh".into()), "the clock moved but the bytes did not");
+    }
+
+    #[test]
+    fn a_soft_invalidation_marks_rather_than_removes() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &["table:orders"], 0.0, 0.0);
+
+        let r = e.invalidate(&["table:orders".into()], InvalidationMode::Soft, "sdk", 10.0);
+        assert_eq!(r.keys_soft.len(), 1);
+        assert!(e.store.contains(1), "a soft invalidation deleted the object");
+        assert!(e.refresh_queue.contains(&1));
+
+        assert!(e.get(1, "analytics", 11.0).is_some(), "the one permitted stale serve was refused");
+        assert_eq!(e.stale_serves, 1);
+
+        // The rebuild settles the mark, and the object is fresh again.
+        e.rebuild(1, None, 12.0);
+        assert!(!e.consistency.is_stale(1));
+    }
+
+    #[test]
+    fn a_version_bump_retires_a_generation_without_deleting_anything() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &[], 0.0, 0.0);
+        admit(&mut e, 2, &[], 0.0, 1.0);
+        let resident = e.store.len();
+
+        assert_eq!(e.consistency.version("recommendation"), 1);
+        assert_eq!(e.bump_version("recommendation", 5.0), 2);
+
+        assert_eq!(
+            e.store.len(),
+            resident,
+            "the bump flushed the cache, which is the stampede it exists to avoid"
+        );
+        assert_eq!(e.consistency_stats().keys_invalidated, 0);
+    }
+
+    #[test]
+    fn removing_an_object_forgets_what_it_depended_on() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &["row:product:7"], 0.0, 0.0);
+        assert_eq!(e.consistency_stats().tracked_tags, 1);
+
+        // Squeeze everything out.
+        e.set_capacity(1);
+
+        assert!(
+            e.consistency.keys_for_tag("row:product:7").is_empty(),
+            "a tag survived the object it pointed at; the next invalidation would report \
+             work it did not do"
+        );
+        assert_eq!(e.consistency_stats().tracked_tags, 0);
+    }
+
+    #[test]
+    fn correctness_events_are_never_sampled_out_of_the_audit_log() {
+        let mut e = engine(64 * 1024 * 1024);
+        admit(&mut e, 1, &["t"], 0.0, 0.0);
+        e.invalidate(&["t".into()], InvalidationMode::Hard, "postgres", 1.0);
+        e.bump_version("recommendation", 2.0);
+
+        let entries = e.audit.recent(100);
+        assert!(
+            entries.iter().any(|x| x.kind == "invalidate"),
+            "an invalidation went unrecorded"
+        );
+        assert!(entries.iter().any(|x| x.kind == "version_bump"));
+        // And the sentence has to actually say something.
+        let inv = entries.iter().find(|x| x.kind == "invalidate").unwrap();
+        assert!(inv.message.contains("postgres"), "the log does not say where the change came from");
+    }
 }

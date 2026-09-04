@@ -43,6 +43,9 @@ pub struct CapacityController {
     pub manual: bool,
     pub last_change_ms: f64,
     pub last_decision: String,
+    /// The controller runs several times a second. Without this, holding steady would write
+    /// a log line every tick and bury everything that mattered.
+    last_audit_ms: f64,
 }
 
 impl CapacityController {
@@ -51,6 +54,7 @@ impl CapacityController {
             manual: !cfg.capacity.auto,
             last_change_ms: -1e12,
             last_decision: "Hold".to_string(),
+            last_audit_ms: -1e12,
         }
     }
 
@@ -172,10 +176,45 @@ impl CapacityController {
         if engine.now_ms - self.last_change_ms < cooldown_ms {
             return Some(report);
         }
+
+        let step = report.marginal.first().cloned();
+        let (delta_hit, savings, rent) = step
+            .map(|m| (m.delta_hit_rate, m.backend_savings_usd_hr, m.cache_cost_usd_hr))
+            .unwrap_or((0.0, 0.0, 0.0));
+        let roi = if rent > 0.0 { savings / rent } else { 0.0 };
+
         if report.recommended_bytes != report.logical_bytes {
+            let from = report.logical_bytes;
             engine.set_capacity(report.recommended_bytes);
             self.last_change_ms = engine.now_ms;
             self.last_decision = report.decision.clone();
+            self.last_audit_ms = engine.now_ms;
+            // Buying or releasing memory is the most expensive thing this system does on
+            // its own initiative, so it always gets a sentence explaining the arithmetic.
+            engine.audit_capacity(
+                from,
+                report.recommended_bytes,
+                delta_hit,
+                savings,
+                rent,
+                roi,
+                cfg.capacity.roi_threshold,
+                true,
+            );
+        } else if engine.now_ms - self.last_audit_ms > 60_000.0 {
+            // The decision *not* to spend is the one a reader is most likely to doubt, so
+            // it is recorded too — just far less often.
+            self.last_audit_ms = engine.now_ms;
+            engine.audit_capacity(
+                report.logical_bytes,
+                report.marginal.first().map(|m| m.to_bytes).unwrap_or(report.logical_bytes),
+                delta_hit,
+                savings,
+                rent,
+                roi,
+                cfg.capacity.roi_threshold,
+                false,
+            );
         }
         Some(report)
     }

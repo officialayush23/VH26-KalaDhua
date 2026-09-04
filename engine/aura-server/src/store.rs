@@ -85,7 +85,6 @@ pub struct Store {
     used_bytes: u64,
     pub l1_stats: LayerStats,
     pub l2_stats: LayerStats,
-    pub cdn_stats: LayerStats,
     pub evictions: u64,
     pub admissions: u64,
     pub rejections: u64,
@@ -104,7 +103,6 @@ impl Store {
             used_bytes: 0,
             l1_stats: LayerStats::default(),
             l2_stats: LayerStats::default(),
-            cdn_stats: LayerStats::default(),
             evictions: 0,
             admissions: 0,
             rejections: 0,
@@ -194,27 +192,8 @@ impl Store {
         Some(e)
     }
 
-    pub fn sweep_expired(&mut self, now_ms: f64) -> usize {
-        let dead: Vec<KeyId> = self
-            .entries
-            .values()
-            .filter(|e| e.expired(now_ms))
-            .map(|e| e.key)
-            .collect();
-        let n = dead.len();
-        for k in dead {
-            self.remove(k);
-        }
-        self.expirations += n as u64;
-        n
-    }
-
     pub fn fits(&self, size_bytes: u64) -> bool {
         self.used_bytes + size_bytes <= self.capacity_bytes
-    }
-
-    pub fn needed_bytes(&self, size_bytes: u64) -> u64 {
-        (self.used_bytes + size_bytes).saturating_sub(self.capacity_bytes)
     }
 
     pub fn context_of(&self, key: KeyId) -> Option<ObjectContext> {
@@ -226,7 +205,4 @@ impl Store {
         )
     }
 
-    pub fn total_hits(&self) -> u64 {
-        self.l1_stats.hits + self.l2_stats.hits
-    }
 }

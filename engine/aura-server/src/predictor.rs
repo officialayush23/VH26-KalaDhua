@@ -206,6 +206,37 @@ impl Predictor {
         self.kind
     }
 
+    /// The bundle the sixty-second decision actually runs on, which is the one that steers
+    /// the cache. The other two horizons only weight it.
+    fn primary(&self) -> Option<&ModelBundle> {
+        self.h60.as_ref().or(self.h10.as_ref()).or(self.h600.as_ref())
+    }
+
+    /// How many features the loaded bundle consumes, which is not the same as how many the
+    /// engine computes: a bundle may name a subset, and the projection maps it on.
+    pub fn feature_count(&self) -> usize {
+        self.primary().map(|b| b.feature_names.len()).unwrap_or(N_FEATURES)
+    }
+
+    pub fn bundle_name(&self) -> String {
+        self.primary().map(|b| b.name.clone()).unwrap_or_else(|| "online".to_string())
+    }
+
+    /// Held-out AUC as the trainer measured it, when the bundle carries one.
+    ///
+    /// Reported rather than trusted: it says how the model did on the trainer's data, not
+    /// on this cache's traffic. The calibration error in `/v1/feedback` is the number that
+    /// says whether it is working *here*.
+    pub fn holdout_auc(&self) -> Option<f64> {
+        let m = &self.primary()?.metrics;
+        for key in ["roc_auc", "auc", "holdout_auc", "test_auc"] {
+            if let Some(v) = m.get(key).and_then(|v| v.as_f64()) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     pub fn loaded_horizons(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
         if self.h10.is_some() {

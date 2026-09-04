@@ -110,6 +110,20 @@ pub struct ObjectContext {
     pub sla_class: SlaClass,
     #[serde(default)]
     pub regen: CostVector,
+    /// What this object was derived from, as free-form tags the application chooses —
+    /// `row:product:1292`, `table:orders`, `tenant:acme`.
+    ///
+    /// The cache never interprets a tag. It only records the edge, so that when the
+    /// application says "this row changed" it can name every object downstream of it
+    /// without knowing what any of them are. Without this the only way to be correct after
+    /// a write is a short TTL, which pays for staleness on every object all the time
+    /// instead of paying for accuracy once, when something actually changes.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// The generation this object belongs to. Bumping a namespace retires everything in it
+    /// without deleting anything. `None` means the object is not versioned.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 fn default_application() -> String {
@@ -128,7 +142,19 @@ impl ObjectContext {
             ttl_ms: None,
             sla_class: SlaClass::Normal,
             regen: CostVector::default(),
+            depends_on: Vec::new(),
+            namespace: None,
         }
+    }
+
+    pub fn with_tags(mut self, tags: &[&str]) -> Self {
+        self.depends_on = tags.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_namespace(mut self, namespace: &str) -> Self {
+        self.namespace = Some(namespace.to_string());
+        self
     }
 
     pub fn with_regen(mut self, regen: CostVector) -> Self {

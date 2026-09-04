@@ -22,6 +22,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use ahash::AHashMap;
 use aura_core::config::Config;
 use aura_core::types::{CostVector, KeyId, ObjectContext};
 use aura_sim::{Attack, Generator, Scenario};
@@ -33,6 +34,7 @@ use tokio::sync::broadcast;
 
 use crate::bench::BenchmarkReport;
 use crate::capacity::CapacityController;
+use crate::consistency::InvalidationMode;
 use crate::engine::Engine;
 use crate::policy::Policy;
 
@@ -80,9 +82,54 @@ struct BackendProbe {
     bytes: u64,
 }
 
+/// Who is currently allowed to rebuild a missing key, and until when.
+///
+/// A cache miss on a popular key is the moment a cache is most dangerous: a thousand
+/// readers all discover the same absence within a few milliseconds and all call the origin,
+/// which is how a cache causes the outage it exists to prevent. The engine cannot make the
+/// origin call itself — only the application knows how to build the object — so it hands
+/// out a lease instead: the first caller is told to rebuild, everyone else is told someone
+/// already is and how long to wait. That is single-flight for a cache that lives outside
+/// the application, and it is the whole reason this map exists.
+#[derive(Debug, Default)]
+struct Leases {
+    held: AHashMap<KeyId, f64>,
+    granted: u64,
+    /// Origin calls this prevented. The number the flash-crowd demo is about.
+    suppressed: u64,
+}
+
+impl Leases {
+    /// Returns `true` if this caller should rebuild, plus how long a losing caller should
+    /// wait before assuming the winner died.
+    fn acquire(&mut self, key: KeyId, now_ms: f64, lease_ms: f64) -> (bool, f64) {
+        // Opportunistic sweep, so a cache that is missing constantly cannot grow this map
+        // without bound while nothing ever calls back to release a lease.
+        if self.held.len() > 8_192 {
+            self.held.retain(|_, until| *until > now_ms);
+        }
+        match self.held.get(&key) {
+            Some(until) if *until > now_ms => {
+                self.suppressed += 1;
+                (false, *until - now_ms)
+            }
+            _ => {
+                self.held.insert(key, now_ms + lease_ms);
+                self.granted += 1;
+                (true, 0.0)
+            }
+        }
+    }
+
+    fn release(&mut self, key: KeyId) {
+        self.held.remove(&key);
+    }
+}
+
 struct App {
     engine: Mutex<Engine>,
     capacity: Mutex<CapacityController>,
+    leases: Mutex<Leases>,
     sim: Mutex<Option<Sim>>,
     cfg: Config,
     bench: Mutex<Option<BenchmarkReport>>,
@@ -138,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Arc::new(App {
         engine: Mutex::new(engine),
         capacity: Mutex::new(CapacityController::new(&cfg)),
+        leases: Mutex::new(Leases::default()),
         sim: Mutex::new(sim),
         cfg,
         bench: Mutex::new(None),
@@ -167,6 +215,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tokio::spawn(drive(app.clone()));
+    if app.supabase.is_some() {
+        tokio::spawn(ship_audit(app.clone()));
+    }
 
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
@@ -180,6 +231,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/cache/:key", delete(cache_delete))
         .route("/v1/cache/:key/refresh", post(cache_refresh))
         .route("/v1/cache/batch/get", post(cache_batch_get))
+        .route("/v1/invalidate", post(invalidate))
+        .route("/v1/version/bump", post(version_bump))
+        .route("/v1/consistency", get(consistency_status))
+        .route("/v1/refresh/queue", get(refresh_queue))
         .route("/v1/explain/recent", get(explain_recent))
         .route("/v1/audit", get(audit_log))
         .route("/v1/training/rows", get(training_rows))
@@ -263,12 +318,21 @@ async fn drive(app: Shared) {
                 }
             }
             eng.recompute_workload();
+            // A real rebuild, not a clock reset. Each one goes through the origin's cost
+            // model and lands on the backend ledger, because refreshing ahead of expiry is
+            // cheaper than an expiry storm but it is not free — and a controller told it
+            // was free would refresh everything, constantly.
             let to_refresh = eng.refresh_candidates(4);
-            let refreshed_at = eng.now_ms;
+            let at = eng.now_ms;
             for k in to_refresh {
-                if let Some(e) = eng.store.entry_mut(k) {
-                    e.inserted_ms = refreshed_at;
-                }
+                let payload = if real_values {
+                    eng.store
+                        .get(k)
+                        .map(|e| Value::String("x".repeat(e.size_bytes.min(8_000_000) as usize)))
+                } else {
+                    None
+                };
+                eng.rebuild(k, payload, at);
             }
         }
 
@@ -291,6 +355,11 @@ fn build_frame(app: &Shared) -> Value {
     let eng = app.engine.lock();
     let cap = app.capacity.lock();
     let report = cap.report(&eng, &app.cfg);
+    let consistency = eng.consistency_stats();
+    let (lease_granted, lease_suppressed) = {
+        let l = app.leases.lock();
+        (l.granted, l.suppressed)
+    };
     let (sim_running, sim_scenario, sim_speed, rps, vtime) = {
         let sim = app.sim.lock();
         match sim.as_ref() {
@@ -409,6 +478,26 @@ fn build_frame(app: &Shared) -> Value {
             "capacity_bytes": eng.store.capacity_bytes(),
             "decision_overhead_us_p50": round2(eng.overhead_p50())
         },
+        // Kept apart from `engine` on purpose. Eviction means the cache was short of space,
+        // invalidation means it was wrong, expiry means time passed — three different
+        // events, and a dashboard that adds them up hides the only one that is a bug.
+        "consistency": {
+            "tracked_keys": consistency.tracked_keys,
+            "tracked_tags": consistency.tracked_tags,
+            "invalidations": consistency.invalidations,
+            "keys_invalidated": consistency.keys_invalidated,
+            "soft_invalidations": consistency.soft_invalidations,
+            "version_bumps": consistency.version_bumps,
+            "stale_serves": consistency.stale_serves,
+            "expired": consistency.expired,
+            "evicted": consistency.evicted,
+            "refresh_backlog": eng.refresh_queue.len(),
+            "namespaces": eng.consistency.versions(),
+            "single_flight": {
+                "leases_granted": lease_granted,
+                "origin_calls_suppressed": lease_suppressed
+            }
+        },
         "fidelity": {
             "traffic": "simulated",
             "values_stored": app.real_values,
@@ -469,6 +558,13 @@ struct AppQuery {
     application: Option<String>,
 }
 
+/// The read path, including the part that decides who is allowed to rebuild a miss.
+///
+/// A miss does not simply say "not here". It says whether *this* caller should go to the
+/// origin (`rebuild: true`) or wait for someone who already is (`rebuild: false`, with a
+/// hint of how long). That is what stops a flash crowd on a cold key turning into a
+/// thousand identical origin calls, and it works from outside the application, which is the
+/// only place a cache like this can stand.
 async fn cache_get(
     State(app): State<Shared>,
     Path(key): Path<String>,
@@ -476,22 +572,43 @@ async fn cache_get(
 ) -> impl IntoResponse {
     let id = key_id(&key);
     let now = now_ms(&app);
-    let mut eng = app.engine.lock();
-    match eng.get(id, q.application.as_deref().unwrap_or("default"), now) {
-        Some(e) => (
-            StatusCode::OK,
-            Json(json!({
-                "hit": true,
-                "value": e.value,
-                "age_ms": round2(e.age_ms(now)),
-                "layer": "L2",
-                "latency_us": 40
-            })),
-        ),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "hit": false, "reason": "miss" })),
-        ),
+    let hit = {
+        let mut eng = app.engine.lock();
+        let found = eng.get(id, q.application.as_deref().unwrap_or("default"), now);
+        let stale = eng.consistency.is_stale(id);
+        found.map(|e| (e.value, e.age_ms(now), stale))
+    };
+    match hit {
+        Some((value, age_ms, stale)) => {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "hit": true,
+                    "value": value,
+                    "age_ms": round2(age_ms),
+                    // Told plainly rather than buried, because a caller that cares about
+                    // freshness needs to be able to choose, and one that does not can
+                    // ignore the field entirely.
+                    "stale": stale,
+                    "layer": "L2",
+                    "latency_us": 40
+                })),
+            )
+        }
+        None => {
+            let lease_ms = app.cfg.engine.rebuild_lease_ms;
+            let (rebuild, wait_ms) = app.leases.lock().acquire(id, now, lease_ms);
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "hit": false,
+                    "reason": "miss",
+                    "rebuild": rebuild,
+                    "retry_after_ms": round2(wait_ms),
+                    "lease_ms": if rebuild { lease_ms } else { 0.0 }
+                })),
+            )
+        }
     }
 }
 
@@ -510,38 +627,203 @@ async fn cache_put(
 ) -> Json<Value> {
     let id = key_id(&key);
     let now = now_ms(&app);
+    // The rebuild is done; whoever was waiting on the lease may proceed.
+    app.leases.lock().release(id);
     let mut eng = app.engine.lock();
     let measured = body.measured.unwrap_or(body.context.regen);
+    let version = body
+        .context
+        .namespace
+        .as_deref()
+        .map(|ns| eng.consistency.version(ns));
     let (decision, evicted) = eng.put(id, body.value, &body.context, measured, now);
     Json(json!({
         "admitted": decision.action == aura_core::types::Action::Admit,
         "reason_code": decision.reason_code,
         "evicted": evicted.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+        "tags": body.context.depends_on,
+        "namespace_version": version,
         "used_bytes": eng.store.used_bytes()
     }))
 }
 
 async fn cache_delete(State(app): State<Shared>, Path(key): Path<String>) -> Json<Value> {
+    let id = key_id(&key);
+    app.leases.lock().release(id);
     let mut eng = app.engine.lock();
-    let removed = eng.store.remove(key_id(&key)).is_some();
+    let removed = eng.store.remove(id).is_some();
+    // Deleting an object without forgetting what it depended on leaves a tag pointing at
+    // nothing, which makes the next invalidation report work it did not do.
+    eng.consistency.forget(id);
     Json(json!({ "removed": removed }))
 }
 
-async fn cache_refresh(State(app): State<Shared>, Path(key): Path<String>) -> Json<Value> {
+/// Rebuild one object now.
+///
+/// With a `value`, the caller has already been to the origin and this stores the result.
+/// Without one, the key is only queued: the engine will not pretend a rebuild happened by
+/// resetting the clock on bytes nobody rebuilt.
+async fn cache_refresh(
+    State(app): State<Shared>,
+    Path(key): Path<String>,
+    body: Option<Json<RefreshBody>>,
+) -> Json<Value> {
     let now = now_ms(&app);
-    let mut eng = app.engine.lock();
     let id = key_id(&key);
-    let queued = match eng.store.entry_mut(id) {
-        Some(e) => {
-            e.inserted_ms = now;
-            true
-        }
-        None => false,
-    };
-    if queued {
-        eng.refreshes += 1;
+    let value = body.and_then(|Json(b)| b.value);
+    let mut eng = app.engine.lock();
+    if !eng.store.contains(id) {
+        return Json(json!({
+            "rebuilt": false,
+            "reason": "not resident; there is nothing to refresh"
+        }));
     }
-    Json(json!({ "queued": queued }))
+    let had_value = value.is_some();
+    let rebuilt = eng.rebuild(id, value, now);
+    Json(json!({
+        "rebuilt": rebuilt,
+        "value_replaced": had_value,
+        // Said out loud, because a refresh that only moves the clock is the failure mode
+        // this endpoint used to have.
+        "note": if had_value {
+            "value replaced and the rebuild charged to the backend ledger"
+        } else {
+            "rebuild charged, but no new value was supplied — send one to actually refresh it"
+        }
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct RefreshBody {
+    /// What the origin returned. Omit to charge the rebuild without replacing the payload,
+    /// which is what the simulator does, where bytes are accounted rather than held.
+    #[serde(default)]
+    value: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct InvalidateBody {
+    tags: Vec<String>,
+    /// `hard` removes immediately — for anything where being wrong is unacceptable.
+    /// `soft` marks stale, so the next reader gets one old value while a rebuild runs.
+    #[serde(default = "hard_mode")]
+    mode: String,
+    #[serde(default = "manual_source")]
+    source: String,
+}
+
+fn hard_mode() -> String {
+    "hard".into()
+}
+fn manual_source() -> String {
+    "manual".into()
+}
+
+/// The endpoint the database trigger, the application SDK and a human all call when
+/// something the cache derived from has changed.
+async fn invalidate(State(app): State<Shared>, Json(body): Json<InvalidateBody>) -> impl IntoResponse {
+    if body.tags.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no tags given; invalidation needs something to match" })),
+        );
+    }
+    let mode = match body.mode.as_str() {
+        "soft" => InvalidationMode::Soft,
+        "hard" => InvalidationMode::Hard,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "mode must be hard or soft", "got": other })),
+            )
+        }
+    };
+    let now = now_ms(&app);
+    let result = app.engine.lock().invalidate(&body.tags, mode, &body.source, now);
+    // A key that was just dropped is a key someone is about to rebuild, so no stale lease
+    // may stand in their way.
+    {
+        let mut leases = app.leases.lock();
+        for k in result.keys_hard.iter().chain(result.keys_soft.iter()) {
+            leases.release(*k);
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "tags": result.tags,
+            "mode": body.mode,
+            "matched": result.matched,
+            "keys_hard": result.keys_hard.len(),
+            "keys_soft": result.keys_soft.len()
+        })),
+    )
+}
+
+#[derive(Deserialize)]
+struct VersionBumpBody {
+    namespace: String,
+}
+
+/// Retire a generation of objects without deleting any of them.
+///
+/// This is how a model redeploy is handled. Flushing instead would empty a large part of
+/// the cache at once and send the whole miss stream at the origin, which is the cache
+/// causing the outage it exists to prevent.
+async fn version_bump(State(app): State<Shared>, Json(body): Json<VersionBumpBody>) -> Json<Value> {
+    let now = now_ms(&app);
+    let version = app.engine.lock().bump_version(&body.namespace, now);
+    Json(json!({ "namespace": body.namespace, "version": version }))
+}
+
+async fn consistency_status(State(app): State<Shared>) -> Json<Value> {
+    let eng = app.engine.lock();
+    let leases = app.leases.lock();
+    let stats = eng.consistency_stats();
+    Json(json!({
+        "tracked_keys": stats.tracked_keys,
+        "tracked_tags": stats.tracked_tags,
+        "namespaces": eng.consistency.versions(),
+        "invalidations": stats.invalidations,
+        "keys_invalidated": stats.keys_invalidated,
+        "soft_invalidations": stats.soft_invalidations,
+        "version_bumps": stats.version_bumps,
+        "stale_serves": stats.stale_serves,
+        "expired": stats.expired,
+        "evicted": stats.evicted,
+        "refresh_backlog": eng.refresh_queue.len(),
+        "single_flight": {
+            "leases_granted": leases.granted,
+            "origin_calls_suppressed": leases.suppressed,
+            "leases_held": leases.held.len()
+        },
+        "recent": eng.consistency.recent_events()
+    }))
+}
+
+/// What the cache owes a rebuild on, with enough context for the application to do it.
+///
+/// The engine knows *which* objects are about to go bad and what they cost; only the
+/// application knows how to make one. So the engine publishes the list and the application
+/// PUTs the new values back. That split is what keeps this cache application-agnostic.
+async fn refresh_queue(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> Json<Value> {
+    let eng = app.engine.lock();
+    let items: Vec<Value> = eng
+        .refresh_backlog(q.limit.min(500))
+        .into_iter()
+        .map(|(k, ctx, remaining)| {
+            json!({
+                "key": k.to_string(),
+                "application": ctx.application,
+                "object_type": ctx.object_type,
+                "size_bytes": ctx.size_bytes,
+                "ttl_ms": ctx.ttl_ms,
+                "ttl_remaining_frac": round4(remaining),
+                "last_regen": ctx.regen
+            })
+        })
+        .collect();
+    Json(json!({ "count": items.len(), "pending": eng.refresh_queue.len(), "items": items }))
 }
 
 #[derive(Deserialize)]
@@ -760,9 +1042,17 @@ async fn model_reload(State(app): State<Shared>, Json(body): Json<ModelReload>) 
         Ok(p) => {
             let horizons: Vec<String> = p.loaded_horizons().iter().map(|s| s.to_string()).collect();
             let kind = p.kind().as_str();
+            let (name, features, auc) = (p.bundle_name(), p.feature_count(), p.holdout_auc());
             eng.predictor = p;
             eng.push_event("ModelReload", &format!("{kind} from {}", dir.display()));
-            Json(json!({ "ok": true, "kind": kind, "horizons": horizons }))
+            eng.audit_model(&name, features, &dir.display().to_string(), auc);
+            Json(json!({
+                "ok": true,
+                "kind": kind,
+                "horizons": horizons,
+                "features": features,
+                "holdout_auc": auc
+            }))
         }
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
@@ -923,8 +1213,16 @@ struct BenchBody {
 fn default_scenario() -> String {
     "expensive_tail".into()
 }
+/// Everything, by default. A benchmark that quietly omits the strongest baselines is a
+/// benchmark nobody should believe, and the three the brief names — LRU, LFU, GDS — are
+/// the least interesting of the nine.
 fn default_policies() -> Vec<String> {
-    vec!["lru".into(), "lfu".into(), "gdsf".into(), "aura".into()]
+    let mut v: Vec<String> = aura_core::policies::BASELINE_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.push("aura".into());
+    v
 }
 fn default_capacity() -> u64 {
     268_435_456
@@ -1067,7 +1365,10 @@ async fn pull_models(app: Shared) {
             Ok((version, bytes)) => match serde_json::from_slice::<predictor::ModelBundle>(&bytes) {
                 Ok(bundle) => {
                     let mut eng = app.engine.lock();
-                    eng.predictor.load_bundle(bundle, &format!("supabase:{name}@{version}"));
+                    let source = format!("supabase:{name}@{version}");
+                    eng.predictor.load_bundle(bundle, &source);
+                    let (features, auc) = (eng.predictor.feature_count(), eng.predictor.holdout_auc());
+                    eng.audit_model(&name, features, &source, auc);
                     loaded.push(name);
                 }
                 Err(e) => tracing::warn!("bundle {name} did not parse: {e}"),
@@ -1079,6 +1380,39 @@ async fn pull_models(app: Shared) {
         let detail = loaded.join(", ");
         app.engine.lock().push_event("ModelReload", &format!("supabase: {detail}"));
         tracing::info!(models = %detail, "models loaded from supabase");
+    }
+}
+
+/// Ships the audit log to Supabase so the explanation of what the cache did outlives the
+/// process that decided it.
+///
+/// Three things matter here. It batches, because one insert per decision would cost more
+/// than the decisions. It re-queues on failure, because an audit log that silently drops
+/// entries when the network hiccups is worse than no audit log — you would trust it. And it
+/// never holds the engine lock across an await, because the cache must keep serving while
+/// a hosted database is slow.
+async fn ship_audit(app: Shared) {
+    let sb = match app.supabase.as_ref() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        ticker.tick().await;
+        let batch = app.engine.lock().audit.drain_unshipped(200);
+        if batch.is_empty() {
+            continue;
+        }
+        let payload: Vec<Value> = batch
+            .iter()
+            .filter_map(|e| serde_json::to_value(e).ok())
+            .collect();
+        if let Err(e) = sb.push_audit(&payload).await {
+            app.engine.lock().audit.requeue(batch);
+            tracing::warn!("audit not shipped, re-queued: {e}");
+            // Back off rather than hammering a project that is refusing writes.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
     }
 }
 

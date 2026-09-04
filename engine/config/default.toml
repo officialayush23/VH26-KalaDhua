@@ -43,6 +43,13 @@ refresh_ttl_threshold = 0.15
 ml_confidence_floor = 0.20
 horizon_weights = [0.5, 0.35, 0.15]
 tail_risk_lambda = 0.35
+# The last fifth of an object's lifetime is the refresh-ahead window: still served, but a
+# rebuild is queued behind the reader. Raise it towards 1.0 to prefer freshness over
+# smoothness, lower it to start rebuilding earlier.
+soft_ttl_fraction = 0.8
+# How long one caller may hold the rebuild lease for a missing key. Long enough to cover an
+# honest origin call, short enough that a caller that died cannot wedge the key.
+rebuild_lease_ms = 5000.0
 
 [capacity]
 auto = true
