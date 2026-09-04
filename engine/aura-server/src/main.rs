@@ -505,19 +505,22 @@ fn build_frame(app: &Shared) -> Value {
     let total = eng.ledger.total();
     for s in eng.shadows.iter() {
         let shadow_total = s.total_usd();
-        baselines.insert(s.policy.as_str().to_string(), json!({
+        baselines.insert(s.name.to_string(), json!({
             "total_usd": round4(shadow_total),
             "regen_usd": round4(s.cost_usd),
             "penalty_usd": round4(s.penalty_usd),
             "holding_usd": round4(s.holding_usd),
-            "hit_rate": round4(s.hit_rate())
+            "hit_rate": round4(s.hit_rate()),
+            // What the baseline is holding right now. Two policies at the same hit rate
+            // are not equivalent if one of them is using half the pool to get there.
+            "used_bytes": s.used_bytes()
         }));
         let gain = if shadow_total > 0.0 {
             (shadow_total - total) / shadow_total
         } else {
             0.0
         };
-        savings.insert(s.policy.as_str().to_string(), json!(round4(gain)));
+        savings.insert(s.name.to_string(), json!(round4(gain)));
     }
 
     let apps: Vec<Value> = eng

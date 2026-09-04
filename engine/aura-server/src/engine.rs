@@ -5,6 +5,7 @@ use aura_core::config::Config;
 use aura_core::features::{idx, AccessEvent, AmbientState, FeatureBuilder, Features, EXTRA_OFFSET};
 use aura_core::signals::SignalBuilder;
 use aura_core::rng::Rng;
+use aura_core::policies::CachePolicy;
 use aura_core::types::{Action, CostVector, Decision, KeyId, ObjectContext};
 use serde::Serialize;
 
@@ -115,13 +116,21 @@ impl CostLedger {
     }
 }
 
-/// A shadow cache that replays the same request stream under one classical policy.
-#[derive(Debug)]
+/// A baseline running beside the engine on the same request stream.
+///
+/// This used to be a scoring function: a hash map plus a `match` that approximated each
+/// policy in one line. That is fine for a sketch and wrong for a claim. W-TinyLFU, S3-FIFO
+/// and SIEVE are *defined* by their structure rather than by a score, and even LFU differs
+/// from "evict the lowest counter" once admission and size-awareness are involved. So the
+/// live baselines now run the same implementations the offline benchmark runs, from
+/// `aura_core::policies`, and the two can no longer disagree about what LRU is.
+///
+/// Cost accounting stays here rather than in the policy: the policies answer "what happens
+/// to this object", and pricing a miss is the engine's question, using the engine's price
+/// table so that every column in the comparison is priced identically.
 pub struct Shadow {
-    pub policy: Policy,
-    resident: AHashMap<KeyId, (u64, f64, f64, f64)>,
-    used_bytes: u64,
-    capacity_bytes: u64,
+    pub name: &'static str,
+    policy: Box<dyn CachePolicy>,
     pub hits: u64,
     pub misses: u64,
     pub cost_usd: f64,
@@ -129,19 +138,30 @@ pub struct Shadow {
     pub holding_usd: f64,
 }
 
+impl std::fmt::Debug for Shadow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shadow")
+            .field("name", &self.name)
+            .field("hits", &self.hits)
+            .field("misses", &self.misses)
+            .finish()
+    }
+}
+
 impl Shadow {
-    pub fn new(policy: Policy, capacity_bytes: u64) -> Self {
-        Self {
+    /// Build a baseline by name. Returns `None` for a name the policy roster does not know,
+    /// so a typo is a missing column rather than a silently different policy.
+    pub fn new(name: &'static str, capacity_bytes: u64) -> Option<Self> {
+        let policy = aura_core::policies::build(name, capacity_bytes)?;
+        Some(Self {
+            name,
             policy,
-            resident: AHashMap::new(),
-            used_bytes: 0,
-            capacity_bytes,
             hits: 0,
             misses: 0,
             cost_usd: 0.0,
             penalty_usd: 0.0,
             holding_usd: 0.0,
-        }
+        })
     }
 
     pub fn total_usd(&self) -> f64 {
@@ -149,7 +169,11 @@ impl Shadow {
     }
 
     pub fn set_capacity(&mut self, bytes: u64) {
-        self.capacity_bytes = bytes.max(1);
+        self.policy.set_capacity_bytes(bytes.max(1));
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.policy.used_bytes()
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -161,64 +185,38 @@ impl Shadow {
         }
     }
 
+    /// One request, exactly as the engine saw it. A baseline that never learns the object's
+    /// size, TTL or rebuild cost cannot be said to have declined to use them.
+    #[allow(clippy::too_many_arguments)]
     pub fn access(
         &mut self,
         key: KeyId,
         size: u64,
         cost_usd: f64,
         now_ms: f64,
-        freq_hint: f64,
+        ttl_ms: f64,
+        regen: CostVector,
         penalty_usd: f64,
         holding_usd: f64,
     ) {
-        match self.resident.get_mut(&key) {
-            Some(slot) => {
-                self.hits += 1;
-                slot.1 = now_ms;
-                slot.3 += 1.0;
-                return;
-            }
-            None => {
-                self.misses += 1;
-                self.cost_usd += cost_usd;
-                self.penalty_usd += penalty_usd;
-                self.holding_usd += holding_usd;
-            }
-        }
-        if size > self.capacity_bytes {
-            return;
-        }
-        while self.used_bytes + size > self.capacity_bytes {
-            let victim = self
-                .resident
-                .iter()
-                .map(|(k, v)| (*k, self.rank(v, now_ms)))
-                .fold(None::<(KeyId, f64)>, |acc, cur| match acc {
-                    Some(a) if a.1 <= cur.1 => Some(a),
-                    _ => Some(cur),
-                });
-            match victim {
-                Some((k, _)) => {
-                    if let Some(v) = self.resident.remove(&k) {
-                        self.used_bytes = self.used_bytes.saturating_sub(v.0);
-                    }
-                }
-                None => break,
-            }
-        }
-        self.resident.insert(key, (size, now_ms, cost_usd, freq_hint.max(1.0)));
-        self.used_bytes += size;
-    }
-
-    fn rank(&self, v: &(u64, f64, f64, f64), now_ms: f64) -> f64 {
-        let (size, last_ms, cost, freq) = *v;
-        match self.policy {
-            Policy::Lru => last_ms,
-            Policy::Lfu => freq,
-            Policy::Gdsf => (freq * cost.max(1e-9)) / (size as f64).max(1.0) * 1e9,
-            Policy::TinyLfu => freq * 0.8 + last_ms / 1e6,
-            Policy::CostAware => cost.max(1e-9) / (size as f64).max(1.0) * 1e9,
-            Policy::TrendAware => freq / (1.0 + (now_ms - last_ms) / 1000.0),
+        let req = aura_core::policies::Request {
+            ts_ms: now_ms,
+            key,
+            size_bytes: size,
+            ttl_ms,
+            regen,
+            application: "shadow",
+            object_type: "object",
+            sla: aura_core::types::SlaClass::Normal,
+        };
+        let result = self.policy.access(&req);
+        if result.hit {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+            self.cost_usd += cost_usd;
+            self.penalty_usd += penalty_usd;
+            self.holding_usd += holding_usd;
         }
     }
 }
@@ -300,9 +298,12 @@ impl Engine {
         let predictor = Predictor::heuristic(cfg.predictor.online_lr);
         let bandit = Bandit::new(cfg.bandit.exploration, seed ^ 0x9E37);
         let consistency = Consistency::new(cfg.engine.soft_ttl_fraction);
-        let shadows = [Policy::Lru, Policy::Lfu, Policy::Gdsf]
-            .iter()
-            .map(|p| Shadow::new(*p, capacity))
+        // The three the brief names, plus GDSF, which is the one that actually competes:
+        // beating LRU in 2026 is not a result, and saying so before someone else does is
+        // better than being told.
+        let shadows = ["lru", "lfu", "gds", "gdsf"]
+            .into_iter()
+            .filter_map(|name| Shadow::new(name, capacity))
             .collect();
         Self {
             profiles: ProfileStore::new(&cfg),
@@ -455,11 +456,6 @@ impl Engine {
         st.hits += 1;
         st.bytes_total += bytes;
 
-        let freq_hint = self
-            .features
-            .key_state(key)
-            .map(|k| k.accesses as f64)
-            .unwrap_or(1.0);
         let hold = self
             .cfg
             .pricing
@@ -474,7 +470,7 @@ impl Engine {
             0.0
         };
         for s in self.shadows.iter_mut() {
-            s.access(key, bytes, saved, now_ms, freq_hint, penalty, hold);
+            s.access(key, bytes, saved, now_ms, entry.ttl_ms, entry.regen, penalty, hold);
         }
 
         self.observe_reuse(key, now_ms, true);
@@ -527,11 +523,6 @@ impl Engine {
             }
         }
 
-        let freq_hint = self
-            .features
-            .key_state(key)
-            .map(|k| k.accesses as f64)
-            .unwrap_or(1.0);
         let shadow_penalty = if latency > self.cfg.pricing.slo_p95_ms {
             self.cfg.pricing.sla_penalty_usd(
                 latency - self.cfg.pricing.slo_p95_ms,
@@ -550,7 +541,8 @@ impl Engine {
                 ctx.size_bytes,
                 cost_usd,
                 now_ms,
-                freq_hint,
+                ctx.ttl_ms.unwrap_or(0.0),
+                regen,
                 shadow_penalty,
                 shadow_holding,
             );

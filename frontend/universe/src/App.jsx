@@ -19,6 +19,7 @@ import {
 } from "@/components/dashboard/panels"
 import { ActivityLog } from "@/components/dashboard/activity"
 import { ProfilesPanel } from "@/components/dashboard/profiles"
+import { BaselinesPanel } from "@/components/dashboard/baselines"
 import { OnboardingPanel } from "@/components/dashboard/onboarding"
 import { AuthNotice, SessionChip, useSession } from "@/components/dashboard/signin"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
@@ -181,6 +182,7 @@ export function App() {
                   className="h-[calc(100svh-330px)] min-h-[520px] xl:col-span-2"
                 />
                 <div className="space-y-4">
+                  <BaselinesPanel frame={frame} />
                   <CapacityPanel frame={frame} />
                   <ApplicationsPanel frame={frame} />
                 </div>
