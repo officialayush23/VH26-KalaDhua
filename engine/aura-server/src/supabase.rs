@@ -1,0 +1,277 @@
+//! Supabase client for the control plane.
+//!
+//! The cache data path deliberately does not go through here. Putting Postgres between
+//! the cache and every request would defeat the point of the cache: on a miss it is the
+//! application service that queries Supabase, measures what that cost, and hands the
+//! measured cost back on the PUT. This module covers the other three jobs, which are all
+//! control plane and all off the hot path:
+//!
+//!   1. pull the active model bundle out of Storage on boot or on demand
+//!   2. publish a benchmark run and its per-policy rows
+//!   3. append events
+//!
+//! Every call is fire-and-report: a Supabase outage degrades the engine to local files
+//! and local telemetry, and never fails a cache request.
+
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+const MODELS_TABLE: &str = "aura_models";
+const RUNS_TABLE: &str = "aura_benchmark_runs";
+const RESULTS_TABLE: &str = "aura_benchmark_results";
+const EVENTS_TABLE: &str = "aura_events";
+const MODEL_BUCKET: &str = "aura-models";
+
+#[derive(Debug, Clone)]
+pub struct Supabase {
+    base_url: String,
+    key: String,
+    client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelRow {
+    name: String,
+    version: String,
+    storage_path: String,
+    #[serde(default)]
+    kind: String,
+}
+
+impl Supabase {
+    /// Reads `SUPABASE_URL` and a service key from the environment. Returns `None` when
+    /// either is absent, which is the normal state for a local run with no cloud project.
+    pub fn from_env() -> Option<Self> {
+        let base_url = first_env(&["SUPABASE_URL"])?.trim_end_matches('/').to_string();
+        let key = first_env(&[
+            "SUPABASE_SERVICE_ROLE_SECRET_KEY",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "SUPABASE_ANON_PUBLIC_KEY",
+            "SUPABASE_KEY",
+        ])?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .ok()?;
+        Some(Self { base_url, key, client })
+    }
+
+    pub fn project(&self) -> &str {
+        &self.base_url
+    }
+
+    fn rest(&self, table: &str) -> String {
+        format!("{}/rest/v1/{table}", self.base_url)
+    }
+
+    fn req(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder
+            .header("apikey", &self.key)
+            .header("authorization", format!("Bearer {}", self.key))
+            .header("content-type", "application/json")
+    }
+
+    /// Downloads the bundle whose `is_active` row wins for `name`. The Postgres row is the
+    /// source of truth for which version is live; Storage only holds the bytes.
+    pub async fn active_bundle(&self, name: &str) -> anyhow::Result<(String, Vec<u8>)> {
+        let url = self.rest(MODELS_TABLE);
+        let res = self
+            .req(self.client.get(&url))
+            .query(&[
+                ("name", format!("eq.{name}")),
+                ("is_active", "eq.true".to_string()),
+                ("select", "name,version,storage_path,kind".to_string()),
+                ("limit", "1".to_string()),
+            ])
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!("model lookup failed: {} {}", res.status(), res.text().await.unwrap_or_default());
+        }
+        let rows: Vec<ModelRow> = res.json().await?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no active model row for {name}"))?;
+
+        // storage_path is stored as `bucket/key`; strip the bucket if it is present so the
+        // same value works whether the writer included it or not.
+        let key = row
+            .storage_path
+            .strip_prefix(&format!("{MODEL_BUCKET}/"))
+            .unwrap_or(&row.storage_path)
+            .to_string();
+        let obj_url = format!("{}/storage/v1/object/{MODEL_BUCKET}/{key}", self.base_url);
+        let obj = self.req(self.client.get(&obj_url)).send().await?;
+        if !obj.status().is_success() {
+            anyhow::bail!("bundle download failed: {} {}", obj.status(), key);
+        }
+        let bytes = obj.bytes().await?.to_vec();
+        tracing::info!(model = %row.name, version = %row.version, kind = %row.kind, "pulled bundle from supabase");
+        Ok((row.version, bytes))
+    }
+
+    /// Lists every active bundle, so a reload can pick up all three horizons at once.
+    pub async fn active_models(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.rest(MODELS_TABLE);
+        let res = self
+            .req(self.client.get(&url))
+            .query(&[
+                ("is_active", "eq.true".to_string()),
+                ("select", "name".to_string()),
+            ])
+            .send()
+            .await?;
+        let rows: Vec<Value> = res.json().await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect())
+    }
+
+    /// Publishes a benchmark report: the run row, then one row per policy. Column names
+    /// match `training/aura_train/supabase_io.py` so both writers agree.
+    pub async fn publish_benchmark(&self, report: &Value, engine_version: &str) -> anyhow::Result<()> {
+        let run_id = report
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("report has no run_id"))?;
+
+        let run_row = json!({
+            "run_id": run_id,
+            "scenario": report.get("scenario").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            "seed": report.get("seed").and_then(|v| v.as_i64()).unwrap_or(0),
+            "capacity_bytes": report.get("capacity_bytes").and_then(|v| v.as_i64()).unwrap_or(0),
+            "requests": report.get("requests").and_then(|v| v.as_i64()).unwrap_or(0),
+            "engine_version": engine_version,
+            "summary": {
+                "winner": report.get("winner"),
+                "improvement_vs": report.get("improvement_vs"),
+                "belady_upper_bound": report.get("belady_upper_bound"),
+            }
+        });
+
+        let res = self
+            .req(self.client.post(self.rest(RUNS_TABLE)))
+            .header("prefer", "resolution=merge-duplicates")
+            .query(&[("on_conflict", "run_id")])
+            .json(&json!([run_row]))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!("run insert failed: {} {}", res.status(), res.text().await.unwrap_or_default());
+        }
+
+        let empty = Vec::new();
+        let rows = report.get("rows").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let payload: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "run_id": run_id,
+                    "policy": r.get("policy"),
+                    "object_hit_rate": r.get("object_hit_rate"),
+                    "byte_hit_rate": r.get("byte_hit_rate"),
+                    "p95_latency_ms": r.get("p95_latency_ms"),
+                    "backend_requests": r.get("backend_requests"),
+                    "total_cost_usd": r.get("total_cost_usd"),
+                    "regen_cost_usd": r.get("regen_cost_usd"),
+                    "sla_penalty_usd": r.get("sla_penalty_usd"),
+                    "decision_overhead_us": r.get("decision_overhead_us_p50"),
+                    "extra": { "memory_overhead_bytes": r.get("memory_overhead_bytes") }
+                })
+            })
+            .collect();
+
+        if !payload.is_empty() {
+            let res = self
+                .req(self.client.post(self.rest(RESULTS_TABLE)))
+                .header("prefer", "resolution=merge-duplicates")
+                .query(&[("on_conflict", "run_id,policy")])
+                .json(&payload)
+                .send()
+                .await?;
+            if !res.status().is_success() {
+                anyhow::bail!("results insert failed: {} {}", res.status(), res.text().await.unwrap_or_default());
+            }
+        }
+
+        tracing::info!(run_id, rows = payload.len(), "published benchmark to supabase");
+        Ok(())
+    }
+
+    pub async fn push_event(&self, kind: &str, detail: Value) -> anyhow::Result<()> {
+        let res = self
+            .req(self.client.post(self.rest(EVENTS_TABLE)))
+            .json(&json!([{ "kind": kind, "detail": detail }]))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!("event insert failed: {}", res.status());
+        }
+        Ok(())
+    }
+
+    /// Round-trips the REST endpoint so the dashboard can show whether the project is
+    /// actually reachable rather than merely configured.
+    pub async fn health(&self) -> bool {
+        let url = self.rest(MODELS_TABLE);
+        match self
+            .req(self.client.get(&url))
+            .query(&[("select", "name"), ("limit", "1")])
+            .send()
+            .await
+        {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
+        }
+    }
+}
+
+fn first_env(names: &[&str]) -> Option<String> {
+    for n in names {
+        if let Ok(v) = std::env::var(n) {
+            let v = v.trim().trim_matches('"').to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Loads `KEY=value` lines from the first `.env` found by walking up from the working
+/// directory. Existing environment variables always win, so a shell export overrides the
+/// file. Kept deliberately small: this is a convenience for local runs, not a config system.
+pub fn load_dotenv() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..5 {
+        for candidate in ["backend/.env", ".env"] {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Some((k, v)) = line.split_once('=') {
+                            let k = k.trim();
+                            let v = v.trim().trim_matches('"').trim_matches('\'');
+                            if std::env::var_os(k).is_none() && !k.is_empty() {
+                                std::env::set_var(k, v);
+                            }
+                        }
+                    }
+                    return Some(path);
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}

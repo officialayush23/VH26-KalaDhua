@@ -82,6 +82,27 @@ child tables rather than JSON columns, `aura_benchmark_results` keyed on (run, p
 rather than a wide run row, orders split from order lines. Verified against Postgres 16:
 schema applies cleanly, is idempotent on re-run, seed produces the expected row counts.
 
+### Supabase connection from the engine — `engine/aura-server/src/supabase.rs`
+Control plane only, and deliberately not on the request path. Pulls the active model
+bundle from Storage on boot and on `POST /v1/model/reload {"source":"supabase"}`,
+publishes benchmark runs and per-policy rows after `POST /v1/bench/run`, appends events.
+Reads `backend/.env` by walking up from the working directory, so it works whether the
+engine is started from `engine/` or the repository root. `GET /v1/supabase` reports
+configured / reachable / active models, and the dashboard shows it.
+
+Verified: env file discovered from a nested directory, an unreachable project logs a
+warning and changes nothing else, the cache keeps serving at a 66% hit rate and the
+benchmark still returns while publishing fails, and an unconfigured engine reports
+cleanly rather than erroring.
+
+Schema note: the first version of `003` was more decomposed than
+`training/aura_train/supabase_io.py` speaks, so every Colab push would have failed on a
+missing column. The base tables now match the writer exactly, with 3NF preserved through
+natural text foreign keys, and `metrics`/`feature_names` are fanned into
+`aura_model_metrics`/`aura_model_features` by trigger. Verified by replaying every real
+payload from `supabase_io.py` against Postgres 16 and confirming four bad-data cases are
+rejected.
+
 ### Dashboard — `frontend/universe/`
 Converted from TypeScript to JSX per `CONTRACTS.md` §9. GSAP animates the metric tickers,
 policy mixture bars and the decision feed. Panels: cost against baselines, cache and
@@ -121,7 +142,9 @@ In rough priority order.
   and `queries.py` exist; nothing calls them from the running demo, so the miss cost is
   currently the simulator's synthetic cost rather than a real query. This is the
   cost-story upgrade: point the analytics app at Supabase and let a real 200-400 ms
-  aggregate be the regeneration cost the cache learns.
+  aggregate be the regeneration cost the cache learns. Note the engine's own Supabase
+  connection is done — this item is about the application services, which is the correct
+  place for it since the cache data path must not go through Postgres.
 - **`deploy/` is empty.** No `docker-compose.yml`, no Dockerfiles, no Railway config.
 - **CDN layer** in the telemetry contract is declared but not implemented; the frame
   omits it rather than reporting zeros.
@@ -129,8 +152,16 @@ In rough priority order.
   ScaleOut are described in the contract but not built.
 - **Comment pass on Python.** The Rust tree has been trimmed (118 comment lines removed);
   `training/` and `apps/` have not.
-- `engine/_incoming_src.tgz` and `frontend/universe/_to_delete/` are leftovers from this
-  session's file transfer. Delete them.
+- `training/sql/superseded/` holds `001_schema.sql` and `002_seed_analytics.sql`, which
+  `003`/`004` replace. Kept for reference; delete when you are sure.
+
+## Documentation
+
+- `docs/CONTRACTS.md` — the frozen interface. Change it before changing code.
+- `docs/ARCHITECTURE.md` — what every file does, written for someone who does not read Rust.
+- `docs/RUNBOOK.md` — exact run steps, the Supabase order, the Colab walkthrough, the demo
+  script and the failure modes.
+- `docs/PROGRESS.md` — this file.
 
 ## Conventions being followed
 

@@ -6,6 +6,7 @@ mod engine;
 mod policy;
 mod predictor;
 mod store;
+mod supabase;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -63,6 +64,7 @@ struct App {
     bench: Mutex<Option<BenchmarkReport>>,
     tx: broadcast::Sender<String>,
     started: std::time::Instant,
+    supabase: Option<supabase::Supabase>,
 }
 
 type Shared = Arc<App>;
@@ -77,7 +79,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    if let Some(path) = supabase::load_dotenv() {
+        tracing::info!(env = %path.display(), "loaded environment file");
+    }
     let cfg = Config::load(args.config.as_deref());
+
+    let sb = supabase::Supabase::from_env();
+    match &sb {
+        Some(s) => tracing::info!(project = %s.project(), "supabase configured"),
+        None => tracing::info!("supabase not configured; running with local files only"),
+    }
 
     let mut engine = Engine::new(cfg.clone(), args.seed);
     if args.models.exists() {
@@ -106,7 +117,15 @@ async fn main() -> anyhow::Result<()> {
         bench: Mutex::new(None),
         tx,
         started: std::time::Instant::now(),
+        supabase: sb,
     });
+
+    // Pulling the active bundle happens after the server is constructed so a slow or
+    // unreachable project delays nothing: the engine serves on its online predictor until
+    // the bundles land.
+    if app.supabase.is_some() {
+        tokio::spawn(pull_models(app.clone()));
+    }
 
     tokio::spawn(drive(app.clone()));
 
@@ -133,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/applications", get(applications))
         .route("/v1/nodes", get(nodes))
         .route("/v1/model/reload", post(model_reload))
+        .route("/v1/supabase", get(supabase_status))
         .route("/v1/scenarios", get(scenarios))
         .route("/v1/sim/start", post(sim_start))
         .route("/v1/sim/stop", post(sim_stop))
@@ -593,10 +613,25 @@ async fn nodes(State(app): State<Shared>) -> Json<Value> {
 #[derive(Deserialize)]
 struct ModelReload {
     #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
     path: Option<String>,
 }
 
 async fn model_reload(State(app): State<Shared>, Json(body): Json<ModelReload>) -> Json<Value> {
+    if body.source.as_deref() == Some("supabase") {
+        if app.supabase.is_none() {
+            return Json(json!({ "ok": false, "error": "supabase is not configured" }));
+        }
+        pull_models(app.clone()).await;
+        let eng = app.engine.lock();
+        return Json(json!({
+            "ok": true,
+            "source": "supabase",
+            "kind": eng.predictor.kind().as_str(),
+            "horizons": eng.predictor.loaded_horizons()
+        }));
+    }
     let dir = PathBuf::from(body.path.unwrap_or_else(|| "models".into()));
     let mut eng = app.engine.lock();
     match predictor::Predictor::load_dir(&dir, app.cfg.predictor.online_lr) {
@@ -802,6 +837,17 @@ async fn bench_run(State(app): State<Shared>, Json(body): Json<BenchBody>) -> im
     match report {
         Ok(r) => {
             *app.bench.lock() = Some(r.clone());
+            if let Some(sb) = app.supabase.clone() {
+                let payload = json!(r);
+                let version = env!("CARGO_PKG_VERSION").to_string();
+                // Publishing must not hold up the response: the caller wants the numbers,
+                // not confirmation that a third party stored them.
+                tokio::spawn(async move {
+                    if let Err(e) = sb.publish_benchmark(&payload, &version).await {
+                        tracing::warn!("benchmark not published: {e}");
+                    }
+                });
+            }
             (StatusCode::OK, Json(json!(r)))
         }
         Err(e) => (
@@ -872,6 +918,71 @@ fn handle_client_message(app: &Shared, text: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// Fetches every active bundle from Supabase and hands them to the predictor. Failure is
+/// logged and dropped: the engine already has a working predictor.
+async fn pull_models(app: Shared) {
+    let sb = match app.supabase.as_ref() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let names = match sb.active_models().await {
+        Ok(n) if !n.is_empty() => n,
+        Ok(_) => {
+            tracing::info!("supabase has no active model rows yet");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("could not list models: {e}");
+            return;
+        }
+    };
+    let mut loaded = Vec::new();
+    for name in names {
+        match sb.active_bundle(&name).await {
+            Ok((version, bytes)) => match serde_json::from_slice::<predictor::ModelBundle>(&bytes) {
+                Ok(bundle) => {
+                    let mut eng = app.engine.lock();
+                    eng.predictor.load_bundle(bundle, &format!("supabase:{name}@{version}"));
+                    loaded.push(name);
+                }
+                Err(e) => tracing::warn!("bundle {name} did not parse: {e}"),
+            },
+            Err(e) => tracing::warn!("bundle {name} not fetched: {e}"),
+        }
+    }
+    if !loaded.is_empty() {
+        let detail = loaded.join(", ");
+        app.engine.lock().push_event("ModelReload", &format!("supabase: {detail}"));
+        tracing::info!(models = %detail, "models loaded from supabase");
+    }
+}
+
+async fn supabase_status(State(app): State<Shared>) -> Json<Value> {
+    match app.supabase.as_ref() {
+        Some(sb) => {
+            let reachable = sb.health().await;
+            let models = if reachable {
+                sb.active_models().await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            Json(json!({
+                "configured": true,
+                "reachable": reachable,
+                "project": sb.project(),
+                "active_models": models,
+                "role": "control plane only: model registry, benchmark results, events. \
+The cache data path does not go through Postgres."
+            }))
+        }
+        None => Json(json!({
+            "configured": false,
+            "reachable": false,
+            "hint": "set SUPABASE_URL and SUPABASE_SERVICE_ROLE_SECRET_KEY, or put them in backend/.env"
+        })),
     }
 }
 
