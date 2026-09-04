@@ -105,25 +105,14 @@ class QuantileLadder:
         self.lr = lr
         self.levels: list[float] = [0.0] * len(_LADDER)
         self.seen = 0
-        # Running mean magnitude, used only to floor the step size. The step is
-        # multiplicative and therefore scale-free by construction, but a level sitting at
-        # exactly zero would never move. A fixed floor of 1.0 is the obvious fix and is
-        # wrong: it is enormous next to a cost of 0.000002 and negligible next to a latency
-        # of 2000, so the ladder converges at one scale and not the other. Flooring against
-        # the data's own magnitude keeps the percentile portable, which is the entire
-        # reason `cost_percentile` can replace absolute cost in the model.
-        self.mean_abs = 0.0
 
     def observe(self, x: float) -> None:
         if self.seen == 0:
             self.levels = [x] * len(_LADDER)
-            self.mean_abs = abs(x)
             self.seen = 1
             return
-        self.mean_abs = 0.05 * abs(x) + 0.95 * self.mean_abs
-        floor = self.mean_abs * 1e-3 if self.mean_abs > 0.0 else 5e-324
         for i, q in enumerate(_LADDER):
-            step = self.lr * max(abs(self.levels[i]), floor)
+            step = self.lr * max(abs(self.levels[i]), 1.0)
             self.levels[i] += step * q if x > self.levels[i] else -step * (1.0 - q)
         # Keep the ladder monotone; SGD on independent levels can cross them.
         for i in range(1, len(self.levels)):

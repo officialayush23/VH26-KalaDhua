@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod audit;
 mod bench;
 mod capacity;
 mod consistency;
@@ -181,9 +180,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/cache/:key/refresh", post(cache_refresh))
         .route("/v1/cache/batch/get", post(cache_batch_get))
         .route("/v1/explain/recent", get(explain_recent))
-        .route("/v1/audit", get(audit_log))
-        .route("/v1/training/rows", get(training_rows))
-        .route("/v1/feedback", get(feedback_stats))
         .route("/v1/explain/:key", get(explain_key))
         .route("/v1/stats", get(stats))
         .route("/v1/workload", get(workload))
@@ -274,9 +270,6 @@ async fn drive(app: Shared) {
 
         {
             let mut eng = app.engine.lock();
-            // Close the feedback loop before the capacity decision, so the bandit and the
-            // online model are judged on outcomes from this tick rather than the last one.
-            eng.settle_feedback(256);
             let mut cap = app.capacity.lock();
             cap.maybe_apply(&mut eng, &app.cfg);
         }
@@ -575,52 +568,6 @@ struct LimitQuery {
 
 fn default_limit() -> usize {
     50
-}
-
-/// The running account of what the cache did, in sentences.
-///
-/// `/v1/explain/{key}` answers "why this object" for a question you already knew to ask.
-/// This is the log you read when you do not: every decision that cost money or touched
-/// correctness, written as prose with the numbers that produced it.
-async fn audit_log(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
-    let eng = app.engine.lock();
-    let entries = eng.audit.recent(q.limit.min(500));
-    Json(json!({
-        "entries": entries,
-        "count": entries.len(),
-        "suppressed_routine": eng.audit.suppressed,
-        "pending_shipment": eng.audit.pending_shipment(),
-    }))
-}
-
-/// Drain matured decisions as labelled training rows.
-///
-/// These are not a log of what the cache did; they are a dataset. Each row carries the
-/// exact feature vector a decision was made from and the labels that arrived up to ten
-/// minutes later, so the trainer never has to reconstruct features and can never disagree
-/// with the engine about what they mean.
-///
-/// Draining is destructive by design: a row handed out once has been consumed, which keeps
-/// the buffer bounded and makes repeated polling cheap.
-async fn training_rows(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
-    let limit = q.limit.min(200_000);
-    let rows = app.engine.lock().drain_training_rows(limit);
-    let count = rows.len();
-    Json(json!({
-        "rows": rows,
-        "count": count,
-        "feature_names": aura_core::features::FEATURE_NAMES,
-        "horizons_ms": crate::feedback::HORIZONS_MS,
-    }))
-}
-
-/// How well the system's own predictions have been holding up.
-///
-/// `calibration_error` is the number to watch: if the model says 0.70 and reality comes
-/// back 0.42, it is confidently wrong and the confidence floor is the only thing keeping
-/// the cache sane.
-async fn feedback_stats(State(app): State<Shared>) -> impl IntoResponse {
-    Json(serde_json::to_value(app.engine.lock().journal_stats()).unwrap_or(Value::Null))
 }
 
 async fn explain_recent(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> Json<Value> {
