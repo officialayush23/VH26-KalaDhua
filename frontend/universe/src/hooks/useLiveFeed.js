@@ -2,16 +2,44 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 const API = import.meta.env.VITE_AURA_URL || "http://localhost:8080"
 const WS = API.replace(/^http/, "ws")
+const HISTORY_LIMIT = 240
 
 /// Subscribes to the engine's telemetry socket. Every frame is a complete snapshot, so a
-/// dropped frame costs nothing and there is no state to reconcile on reconnect. When the
-/// socket cannot be established the hook falls back to polling the same payload.
+/// dropped frame costs nothing and there is no state to reconcile on reconnect. If the
+/// socket cannot be established the hook polls the same payload instead.
+///
+/// History is accumulated here rather than in each chart, so every chart on the page is
+/// drawn from the same series and cannot disagree with its neighbour.
 export function useLiveFeed() {
   const [frame, setFrame] = useState(null)
+  const [history, setHistory] = useState([])
   const [status, setStatus] = useState("connecting")
   const socketRef = useRef(null)
   const retryRef = useRef(null)
   const pollRef = useRef(null)
+
+  const record = useCallback((next) => {
+    setFrame(next)
+    setHistory((prev) => {
+      const t = (next?.virtual_time_s ?? 0)
+      const last = prev[prev.length - 1]
+      if (last && Math.abs(last.t - t) < 0.2) return prev
+      const point = {
+        t,
+        hitRate: next?.layers?.l2?.hit_rate ?? 0,
+        byteHitRate: next?.layers?.l2?.byte_hit_rate ?? 0,
+        p95: next?.latency?.p95_ms ?? 0,
+        p50: next?.latency?.p50_ms ?? 0,
+        totalUsd: next?.cost?.total_usd ?? 0,
+        savedUsd: next?.cost?.saved_vs_no_cache_usd ?? 0,
+        rps: next?.sim?.rps ?? 0,
+        pressure: next?.capacity?.pressure ?? 0,
+        capacity: next?.capacity?.logical_bytes ?? 0,
+      }
+      const out = [...prev, point]
+      return out.length > HISTORY_LIMIT ? out.slice(out.length - HISTORY_LIMIT) : out
+    })
+  }, [])
 
   const stopPolling = () => {
     if (pollRef.current) {
@@ -26,13 +54,13 @@ export function useLiveFeed() {
       try {
         const res = await fetch(`${API}/v1/stats`)
         if (!res.ok) throw new Error(String(res.status))
-        setFrame(await res.json())
+        record(await res.json())
         setStatus("polling")
       } catch {
         setStatus("offline")
       }
     }, 1000)
-  }, [])
+  }, [record])
 
   useEffect(() => {
     let closed = false
@@ -54,7 +82,7 @@ export function useLiveFeed() {
       }
       socket.onmessage = (event) => {
         try {
-          setFrame(JSON.parse(event.data))
+          record(JSON.parse(event.data))
         } catch {
           // A malformed frame is dropped; the next one is a full snapshot anyway.
         }
@@ -76,7 +104,7 @@ export function useLiveFeed() {
       if (retryRef.current) clearTimeout(retryRef.current)
       if (socketRef.current) socketRef.current.close()
     }
-  }, [startPolling])
+  }, [startPolling, record])
 
   const send = useCallback((message) => {
     const socket = socketRef.current
@@ -87,7 +115,7 @@ export function useLiveFeed() {
     return false
   }, [])
 
-  return { frame, status, send, api: API }
+  return { frame, history, status, send, api: API }
 }
 
 export async function post(path, body) {

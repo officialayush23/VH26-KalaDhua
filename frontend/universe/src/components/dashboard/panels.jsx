@@ -4,7 +4,7 @@ import gsap from "gsap"
 import { Button } from "@/components/ui/button"
 import { bytes, cn, ms, pct, usd } from "@/lib/utils"
 import { get, post } from "@/hooks/useLiveFeed"
-import { Bar, Panel, Sparkline, Stat, Ticker } from "./primitives"
+import { Bar, Gauge, Legend, LineChart, Metric, Panel, Pill } from "./primitives"
 
 const POLICY_TONES = {
   lru: "bg-slate-400",
@@ -15,6 +15,138 @@ const POLICY_TONES = {
   trend_aware: "bg-rose-400",
 }
 
+const POLICY_MEANING = {
+  lru: "keeps whatever was touched most recently",
+  lfu: "keeps whatever is touched most often",
+  gdsf: "weighs frequency against cost and size",
+  tiny_lfu: "frequency sketch, resists one-off keys",
+  cost_aware: "keeps whatever is most expensive per byte",
+  trend_aware: "keeps whatever is rising fastest",
+}
+
+/// The headline row. Four numbers that answer, in order: is it working, how much did it
+/// save, how fast is it, and is it about to run out of room.
+export function Headline({ frame, history }) {
+  const l2 = frame?.layers?.l2 ?? {}
+  const cost = frame?.cost ?? {}
+  const cap = frame?.capacity ?? {}
+  const latency = frame?.latency ?? {}
+
+  const savings = cost.savings_vs ?? {}
+  const best = Object.entries(savings).reduce(
+    (acc, [k, v]) => (v > acc.v ? { k, v } : acc),
+    { k: null, v: -Infinity }
+  )
+
+  const spark = history.slice(-80).map((h) => ({ x: h.t, y: h.hitRate }))
+  const costSpark = history.slice(-80).map((h) => ({ x: h.t, y: h.savedUsd }))
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-4">
+      <Panel
+        title="Requests served from cache"
+        subtitle="Share of requests answered without touching a backend."
+        className="xl:col-span-1"
+      >
+        <div className="flex items-center justify-center">
+          <Gauge
+            fraction={l2.hit_rate ?? 0}
+            value={pct(l2.hit_rate ?? 0, 1)}
+            label="object hit rate"
+            tone="stroke-emerald-400"
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-3 text-[12px]">
+          <div>
+            <div className="text-muted-foreground">Hits</div>
+            <div className="font-mono tabular-nums">{(l2.hits ?? 0).toLocaleString()}</div>
+          </div>
+          <div>
+            <div className="text-muted-foreground">Backend calls</div>
+            <div className="font-mono tabular-nums">{(l2.misses ?? 0).toLocaleString()}</div>
+          </div>
+        </div>
+      </Panel>
+
+      <Panel
+        title="Money not spent"
+        subtitle="Backend work the cache avoided, priced with the cost model."
+        className="xl:col-span-2"
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Metric
+            label="Avoided so far"
+            value={usd(cost.saved_vs_no_cache_usd ?? 0)}
+            tone="good"
+            size="lg"
+            explain="What running with no cache at all would have cost, minus what this run cost."
+          />
+          <Metric
+            label={best.k ? `Cheaper than ${best.k}` : "Versus baselines"}
+            value={best.k && best.v > -Infinity ? pct(best.v, 1) : "—"}
+            tone={best.v > 0 ? "good" : "bad"}
+            size="lg"
+            explain="Same request stream replayed through the classical policy, same prices."
+          />
+        </div>
+        <div className="mt-4">
+          <LineChart
+            points={costSpark}
+            height={120}
+            tone="stroke-emerald-400"
+            fill="fill-emerald-400/10"
+            yFormat={(v) => `$${v.toFixed(1)}`}
+            xFormat={(v) => `${v.toFixed(0)}s`}
+            yLabel="dollars avoided"
+            xLabel="simulated seconds"
+          />
+        </div>
+      </Panel>
+
+      <Panel
+        title="Speed and headroom"
+        subtitle="What users feel, and how close the pool is to full."
+        className="xl:col-span-1"
+      >
+        <div className="space-y-3">
+          <Metric
+            label="p95 response"
+            value={ms(latency.p95_ms ?? 0)}
+            explain="95 of every 100 requests are faster than this."
+            tone={(latency.p95_ms ?? 0) > 150 ? "warn" : "good"}
+          />
+          <div className="rounded-xl border border-border/60 bg-background/50 px-4 py-3">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                Memory in use
+              </span>
+              <span className="font-mono text-sm tabular-nums">{pct(cap.pressure ?? 0, 0)}</span>
+            </div>
+            <div className="mt-2">
+              <Bar
+                fraction={cap.pressure ?? 0}
+                tone={(cap.pressure ?? 0) > 0.9 ? "bg-amber-400" : "bg-primary"}
+              />
+            </div>
+            <div className="mt-2 text-[12px] text-muted-foreground">
+              {bytes(cap.used_bytes ?? 0)} of {bytes(cap.logical_bytes ?? 0)}
+            </div>
+          </div>
+        </div>
+        <div className="mt-3">
+          <LineChart
+            points={spark}
+            height={80}
+            yFormat={(v) => pct(v, 0)}
+            xFormat={(v) => `${v.toFixed(0)}s`}
+            yLabel="hit rate over time"
+          />
+        </div>
+      </Panel>
+    </div>
+  )
+}
+
 export function CostPanel({ frame }) {
   const cost = frame?.cost ?? {}
   const baselines = cost.baselines ?? {}
@@ -22,94 +154,67 @@ export function CostPanel({ frame }) {
     policy,
     total: typeof v === "object" ? v.total_usd : v,
     hit: typeof v === "object" ? v.hit_rate : null,
+    regen: typeof v === "object" ? v.regen_usd : null,
+    penalty: typeof v === "object" ? v.penalty_usd : null,
   }))
-  rows.push({ policy: "aura", total: cost.total_usd ?? 0, hit: frame?.layers?.l2?.hit_rate ?? 0 })
-
+  rows.push({
+    policy: "aura",
+    total: cost.total_usd ?? 0,
+    hit: frame?.layers?.l2?.hit_rate ?? 0,
+    regen: cost.backend_usd ?? 0,
+    penalty: cost.sla_penalty_usd ?? 0,
+  })
+  rows.sort((a, b) => (a.total ?? 0) - (b.total ?? 0))
   const max = Math.max(...rows.map((r) => r.total || 0), 1e-9)
 
   return (
     <Panel
-      title="Cost against the baselines"
-      subtitle="Every policy is replayed on the identical request stream, priced with the same cost model."
+      title="Total cost by policy"
+      subtitle="Every policy replayed on the identical request stream and priced with the same model. Lower is better."
+      footer="Cost is regeneration plus SLA penalty plus the rent on the memory held. A policy with a better hit rate can still lose if it kept the cheap objects."
     >
-      <div className="space-y-2.5">
-        {rows.map((r) => (
-          <div key={r.policy} className="grid grid-cols-[5.5rem_1fr_5rem] items-center gap-3">
-            <span
-              className={cn(
-                "font-mono text-xs",
-                r.policy === "aura" ? "font-semibold text-primary" : "text-muted-foreground"
-              )}
-            >
-              {r.policy}
-            </span>
+      <div className="space-y-3">
+        {rows.map((r, i) => (
+          <div key={r.policy}>
+            <div className="mb-1 flex items-baseline justify-between gap-3">
+              <span className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "font-mono text-[13px]",
+                    r.policy === "aura" ? "font-semibold text-primary" : "text-foreground"
+                  )}
+                >
+                  {r.policy}
+                </span>
+                {i === 0 && <Pill tone="good">cheapest</Pill>}
+                {r.policy === "aura" && i !== 0 && <Pill tone="accent">this engine</Pill>}
+              </span>
+              <span className="font-mono text-[13px] tabular-nums">{usd(r.total)}</span>
+            </div>
             <Bar
               fraction={(r.total || 0) / max}
-              tone={r.policy === "aura" ? "bg-primary" : "bg-muted-foreground/40"}
+              height="h-2.5"
+              tone={r.policy === "aura" ? "bg-primary" : "bg-muted-foreground/35"}
             />
-            <span className="text-right font-mono text-xs tabular-nums">
-              {usd(r.total, 2)}
-            </span>
+            <div className="mt-1 flex flex-wrap gap-x-4 text-[11px] text-muted-foreground">
+              <span>hit rate {r.hit !== null ? pct(r.hit) : "—"}</span>
+              {r.regen !== null && <span>rebuild {usd(r.regen)}</span>}
+              {r.penalty !== null && <span>SLA penalty {usd(r.penalty)}</span>}
+            </div>
           </div>
         ))}
       </div>
-      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <Stat
-          label="Total spend"
-          value={<Ticker value={cost.total_usd} format={(v) => usd(v)} />}
-        />
-        <Stat
-          label="Avoided"
-          tone="good"
-          value={<Ticker value={cost.saved_vs_no_cache_usd} format={(v) => usd(v)} />}
-          hint="versus no cache at all"
-        />
-        <Stat
-          label="SLA penalty"
-          tone={cost.sla_penalty_usd > 0 ? "warn" : "default"}
-          value={<Ticker value={cost.sla_penalty_usd} format={(v) => usd(v)} />}
-        />
-        <Stat
-          label="Burn rate"
-          value={<Ticker value={cost.burn_rate_usd_per_hour} format={(v) => `${usd(v)}/hr`} />}
-        />
-      </div>
-    </Panel>
-  )
-}
 
-export function LayerPanel({ frame }) {
-  const l2 = frame?.layers?.l2 ?? {}
-  const l1 = frame?.layers?.l1 ?? {}
-  const latency = frame?.latency ?? {}
-  const engine = frame?.engine ?? {}
-
-  return (
-    <Panel title="Cache and latency" subtitle="Read path is a lookup; no model runs on a hit.">
-      <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-        <Stat
-          label="L2 hit rate"
-          tone="good"
-          value={<Ticker value={l2.hit_rate} format={(v) => pct(v)} />}
-          hint={`${(l2.hits ?? 0).toLocaleString()} hits`}
-        />
-        <Stat
-          label="Byte hit rate"
-          value={<Ticker value={l2.byte_hit_rate} format={(v) => pct(v)} />}
-        />
-        <Stat label="L1 window" value={<Ticker value={l1.hit_rate} format={(v) => pct(v)} />} />
-        <Stat
-          label="Backend calls"
-          value={<Ticker value={l2.misses} format={(v) => Math.round(v).toLocaleString()} />}
-        />
-        <Stat label="p50" value={<Ticker value={latency.p50_ms} format={ms} />} />
-        <Stat label="p95" value={<Ticker value={latency.p95_ms} format={ms} />} />
-        <Stat label="p99" value={<Ticker value={latency.p99_ms} format={ms} />} />
-        <Stat
-          label="Decision cost"
-          value={<Ticker value={engine.decision_overhead_us_p50} format={(v) => `${v.toFixed(1)} µs`} />}
-          hint="p50, write path only"
-        />
+      <div className="mt-5 grid gap-3 sm:grid-cols-4">
+        <Metric label="Rebuild cost" value={usd(cost.backend_usd ?? 0)} size="sm"
+          explain="Backend work actually paid for." />
+        <Metric label="Memory rent" value={usd(cost.cache_usd ?? 0)} size="sm"
+          explain="What holding the cached bytes costs." />
+        <Metric label="SLA penalty" value={usd(cost.sla_penalty_usd ?? 0)} size="sm"
+          tone={(cost.sla_penalty_usd ?? 0) > 0 ? "warn" : "default"}
+          explain="Charged when a response is slower than the target." />
+        <Metric label="Burn rate" value={`${usd(cost.burn_rate_usd_per_hour ?? 0)}`} unit="/hr" size="sm"
+          explain="Current spend extrapolated to an hour." />
       </div>
     </Panel>
   )
@@ -119,38 +224,83 @@ export function PolicyPanel({ frame }) {
   const policy = frame?.policy ?? {}
   const mixture = policy.mixture ?? {}
   const workload = frame?.workload ?? {}
-  const entries = Object.entries(mixture)
+  const f = workload.features ?? {}
+  const entries = Object.entries(mixture).sort((a, b) => b[1] - a[1])
+  const leader = entries[0]
+
+  const REGIME_EXPLAIN = {
+    Steady: "Traffic is skewed but stable. Nothing unusual to defend against.",
+    FlashCrowd: "Traffic has collapsed onto a few keys. Keep them, evict everything else.",
+    Scan: "A sweep of one-off keys is passing through. Admitting them would flush the working set.",
+    Shifting: "The popular set is being replaced. Old favourites are going cold.",
+    Expensive: "The costly objects are the rare ones. Hit rate and cost disagree here.",
+    Growing: "The working set is outgrowing the pool.",
+  }
 
   return (
     <Panel
-      title="Policy mixture"
-      subtitle="Thompson sampling over six experts. The blend moves as the workload does."
+      title="How the cache is deciding right now"
+      subtitle="Six classical strategies run as competing experts. The engine blends them by how well each is paying off, and the blend shifts as traffic changes."
+      actions={<Pill tone="accent">{policy.predictor ?? "—"} predictor</Pill>}
     >
-      <div className="mb-3 flex h-3 w-full overflow-hidden rounded-full">
-        {entries.map(([name, weight]) => (
+      <div className="mb-2 flex h-4 w-full overflow-hidden rounded-lg">
+        {Object.entries(mixture).map(([name, weight]) => (
           <MixtureSegment key={name} name={name} weight={weight} />
         ))}
       </div>
-      <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
-        {entries.map(([name, weight]) => (
-          <div key={name} className="flex items-center gap-2 text-xs">
-            <span className={cn("h-2 w-2 shrink-0 rounded-full", POLICY_TONES[name] ?? "bg-muted")} />
-            <span className="truncate text-muted-foreground">{name}</span>
-            <span className="ml-auto font-mono tabular-nums">{pct(weight, 0)}</span>
-          </div>
-        ))}
-      </div>
-      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <Stat label="Regime" value={<span className="text-lg">{workload.regime ?? "—"}</span>}
-          hint={`confidence ${pct(workload.confidence ?? 0, 0)}`} />
-        <Stat label="Predictor" value={<span className="text-lg">{policy.predictor ?? "—"}</span>}
-          hint={`confidence ${pct(policy.predictor_confidence ?? 0, 0)}`} />
-        <Stat label="Scan score"
-          value={<Ticker value={workload.features?.scan_score} format={(v) => v.toFixed(3)} />} />
-        <Stat label="Bandit regret"
-          value={<Ticker value={policy.bandit_regret} format={(v) => v.toFixed(4)} />} />
+      <Legend
+        items={Object.entries(mixture).map(([name, weight]) => ({
+          label: name,
+          tone: POLICY_TONES[name] ?? "bg-muted",
+          value: pct(weight, 0),
+        }))}
+      />
+
+      {leader && (
+        <p className="mt-3 rounded-lg border border-border/60 bg-background/40 px-3 py-2 text-[12.5px] leading-snug">
+          <span className="font-medium">Leaning on {leader[0]}</span>{" "}
+          <span className="text-muted-foreground">
+            ({pct(leader[1], 0)} of the blend) — {POLICY_MEANING[leader[0]]}.
+          </span>
+        </p>
+      )}
+
+      <div className="mt-4 rounded-xl border border-border/60 bg-background/40 p-4">
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+            Detected traffic pattern
+          </span>
+          <Pill tone={workload.regime === "Scan" ? "warn" : "default"}>
+            {workload.regime ?? "—"} · {pct(workload.confidence ?? 0, 0)} confident
+          </Pill>
+        </div>
+        <p className="mt-2 text-[12.5px] leading-snug text-muted-foreground">
+          {REGIME_EXPLAIN[workload.regime] ?? "Waiting for enough traffic to classify."}
+        </p>
+        <div className="mt-3 grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-3">
+          <Signal label="Burstiness" value={f.burstiness} explain="how concentrated traffic is" />
+          <Signal label="Entropy" value={f.entropy} explain="how spread out the keys are" />
+          <Signal label="Scan score" value={f.scan_score} explain="share of never-seen keys" />
+          <Signal label="Popularity shift" value={f.popularity_shift} explain="how fast the hot set turns over" />
+          <Signal label="Working set growth" value={f.working_set_growth} explain="is the key space expanding" />
+          <Signal label="Reuse gap p50" value={f.reuse_distance_p50} explain="typical ms between repeats" fmt={(v) => `${v.toFixed(0)} ms`} />
+        </div>
       </div>
     </Panel>
+  )
+}
+
+function Signal({ label, value, explain, fmt }) {
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[12px] text-muted-foreground">{label}</span>
+        <span className="font-mono text-[12px] tabular-nums">
+          {value === undefined ? "—" : fmt ? fmt(value) : Number(value).toFixed(3)}
+        </span>
+      </div>
+      <div className="text-[10.5px] leading-tight text-muted-foreground/70">{explain}</div>
+    </div>
   )
 }
 
@@ -171,41 +321,51 @@ function MixtureSegment({ name, weight }) {
 
 export function CapacityPanel({ frame }) {
   const cap = frame?.capacity ?? {}
-  const marginal = cap.marginal?.[0] ?? {}
+  const m = cap.marginal?.[0] ?? {}
   const mrc = (cap.mrc ?? []).map((p) => ({ x: p.bytes, y: p.hit_rate }))
 
-  const decisionTone =
+  const tone =
     cap.decision === "ScaleUp" ? "good" : cap.decision === "ScaleDown" ? "warn" : "default"
 
   return (
     <Panel
-      title="Capacity control"
-      subtitle="Memory is bought only when the next block pays for itself."
+      title="Should we buy more memory?"
+      subtitle="The engine answers this in dollars, not in a utilisation threshold: it prices the hit rate the next block would buy against what that block costs to rent."
+      actions={<Pill tone={tone}>{cap.decision ?? "—"}</Pill>}
+      footer={cap.reason}
     >
-      <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-        <Stat label="Pool" value={bytes(cap.logical_bytes)} hint={`${bytes(cap.used_bytes)} used`} />
-        <Stat label="Pressure" value={<Ticker value={cap.pressure} format={(v) => pct(v, 0)} />} />
-        <Stat label="Decision" tone={decisionTone} value={<span className="text-lg">{cap.decision ?? "—"}</span>} />
-        <Stat
-          label="Net of next step"
-          tone={marginal.net_usd_hr > 0 ? "good" : "bad"}
-          value={<Ticker value={marginal.net_usd_hr} format={(v) => `${usd(v)}/hr`} />}
-          hint={`+${pct(marginal.delta_hit_rate ?? 0, 1)} hit rate`}
-        />
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <Metric label="Pool size now" value={bytes(cap.logical_bytes ?? 0)} size="sm"
+          explain={`${bytes(cap.used_bytes ?? 0)} of it in use`} />
+        <Metric label="Next step would be" value={bytes(m.to_bytes ?? 0)} size="sm"
+          explain={`buys ${pct(m.delta_hit_rate ?? 0, 2)} more hit rate`} />
+        <Metric label="That saves" value={`${usd(m.backend_savings_usd_hr ?? 0)}`} unit="/hr" size="sm"
+          tone="good" explain="backend work no longer paid for" />
+        <Metric label="Net result" value={`${usd(m.net_usd_hr ?? 0)}`} unit="/hr" size="sm"
+          tone={(m.net_usd_hr ?? 0) > 0 ? "good" : "bad"}
+          explain={`after ${usd(m.cache_cost_usd_hr ?? 0)}/hr of memory rent`} />
       </div>
-      <p className="mt-3 text-xs text-muted-foreground">{cap.reason}</p>
-      <div className="mt-3">
-        <div className="mb-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-          Miss ratio curve
+      <div className="mt-4">
+        <div className="mb-1 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+          Hit rate against pool size
         </div>
-        <Sparkline points={mrc} tone="stroke-primary" />
+        <LineChart
+          points={mrc}
+          height={150}
+          yFormat={(v) => pct(v, 0)}
+          xFormat={(v) => bytes(v)}
+          yLabel="hit rate"
+          xLabel="pool size"
+        />
+        <p className="mt-1 text-[12px] text-muted-foreground">
+          The curve flattens as it goes right. Once the extra hit rate is worth less than
+          the rent, buying more memory loses money.
+        </p>
       </div>
     </Panel>
   )
 }
 
-/// New decisions animate in from the top. Without that, a fast feed reads as a flicker
-/// and it is impossible to see that anything changed.
 export function DecisionFeed({ frame }) {
   const decisions = frame?.recent_decisions ?? []
   const listRef = useRef(null)
@@ -220,51 +380,52 @@ export function DecisionFeed({ frame }) {
     if (!fresh.length) return
     const tween = gsap.fromTo(
       fresh,
-      { opacity: 0, x: -10 },
-      { opacity: 1, x: 0, duration: 0.35, stagger: 0.03, ease: "power2.out" }
+      { opacity: 0, x: -8 },
+      { opacity: 1, x: 0, duration: 0.3, stagger: 0.025, ease: "power2.out" }
     )
     return () => tween.kill()
   }, [decisions])
 
   return (
     <Panel
-      title="Decisions"
-      subtitle="Why each object was admitted or refused, with the numbers behind it."
+      title="Live decisions"
+      subtitle="Each object the cache was offered, and why it was kept or refused."
       className="h-full"
+      footer="Value density is expected value divided by what it costs to hold. The bar is the density of the object that would have to be evicted to make room."
     >
-      <div ref={listRef} className="max-h-[26rem] space-y-1.5 overflow-y-auto pr-1">
+      <div ref={listRef} className="max-h-[30rem] space-y-2 overflow-y-auto pr-1">
         {decisions.length === 0 && (
-          <p className="text-xs text-muted-foreground">waiting for traffic</p>
+          <p className="text-[13px] text-muted-foreground">Waiting for traffic.</p>
         )}
         {decisions.map((d, i) => (
           <article
             key={`${d.key}-${d.t}-${i}`}
             data-k={`${d.key}-${d.t}`}
-            className="rounded-lg border border-border/60 bg-background/40 p-2.5"
+            className="rounded-xl border border-border/60 bg-background/40 p-3"
           >
             <div className="flex items-center gap-2">
               <span
                 className={cn(
-                  "rounded px-1.5 py-0.5 font-mono text-[10px] uppercase",
+                  "rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
                   d.action === "Admit"
-                    ? "bg-emerald-500/15 text-emerald-500"
-                    : "bg-rose-500/15 text-rose-500"
+                    ? "bg-emerald-500/15 text-emerald-400"
+                    : "bg-rose-500/15 text-rose-400"
                 )}
               >
-                {d.action}
+                {d.action === "Admit" ? "kept" : "refused"}
               </span>
-              <span className="truncate font-mono text-xs">{d.key}</span>
-              <span className="ml-auto shrink-0 font-mono text-[11px] text-muted-foreground">
-                {usd(d.economic_value_usd, 6)}
-              </span>
+              <span className="truncate font-mono text-[12px]">{d.key}</span>
             </div>
-            <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
-              <span>reuse 60s {pct(d.reuse_probability?.h60s ?? 0, 0)}</span>
-              <span>density {Number(d.value_density ?? 0).toFixed(2)}</span>
-              <span>bar {Number(d.eviction_threshold ?? 0).toFixed(2)}</span>
+            <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
+              <Field label="rebuild cost" value={usd(d.economic_value_usd ?? 0, 6)} />
+              <Field label="chance of reuse" value={pct(d.reuse_probability?.h60s ?? 0, 0)} />
+              <Field
+                label="value vs bar"
+                value={`${Number(d.value_density ?? 0).toFixed(1)} / ${Number(d.eviction_threshold ?? 0).toFixed(1)}`}
+              />
             </div>
             {d.reasons?.length > 0 && (
-              <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+              <p className="mt-2 text-[11.5px] leading-snug text-muted-foreground">
                 {d.reasons[0]}
               </p>
             )}
@@ -275,32 +436,73 @@ export function DecisionFeed({ frame }) {
   )
 }
 
+function Field({ label, value }) {
+  return (
+    <div>
+      <div className="text-muted-foreground">{label}</div>
+      <div className="font-mono tabular-nums">{value}</div>
+    </div>
+  )
+}
+
 export function ApplicationsPanel({ frame }) {
   const apps = frame?.applications ?? []
+  const PROFILE = {
+    db_heavy: "rebuilding means a database query",
+    gpu_heavy: "rebuilding means GPU work",
+    mixed: "rebuilding means CPU plus a query",
+  }
   return (
-    <Panel title="Applications" subtitle="Different cost shapes, which is why one global policy underperforms.">
-      <div className="space-y-2">
-        {apps.length === 0 && <p className="text-xs text-muted-foreground">no traffic yet</p>}
+    <Panel
+      title="Per application"
+      subtitle="Three services with different cost shapes. This is why a single global policy underperforms: the right trade-off for a 40 KB query result is not the right one for a 2 MB media file."
+    >
+      <div className="space-y-3">
+        {apps.length === 0 && <p className="text-[13px] text-muted-foreground">No traffic yet.</p>}
         {apps.map((a) => (
-          <div key={a.application} className="rounded-lg border border-border/60 p-2.5">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium">{a.application}</span>
-              <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                {a.cost_profile}
-              </span>
-              <span className="ml-auto font-mono text-xs tabular-nums">{pct(a.hit_rate)}</span>
+          <div key={a.application} className="rounded-xl border border-border/60 bg-background/40 p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[13px] font-medium">{a.application}</span>
+              <Pill>{PROFILE[a.cost_profile] ?? a.cost_profile}</Pill>
+              <span className="ml-auto font-mono text-[13px] tabular-nums">{pct(a.hit_rate)}</span>
             </div>
-            <div className="mt-1.5">
+            <div className="mt-2">
               <Bar fraction={a.hit_rate} tone="bg-primary/70" />
             </div>
-            <div className="mt-1.5 flex flex-wrap gap-x-3 text-[11px] text-muted-foreground">
-              <span>{Number(a.requests ?? 0).toLocaleString()} req</span>
-              <span>avg {bytes(a.avg_object_bytes)}</span>
-              <span>regen {ms(a.regen_p50_ms)}</span>
-              <span>{usd(a.cost_usd, 3)}</span>
+            <div className="mt-2 grid grid-cols-4 gap-2 text-[11px]">
+              <Field label="requests" value={Number(a.requests ?? 0).toLocaleString()} />
+              <Field label="avg size" value={bytes(a.avg_object_bytes)} />
+              <Field label="rebuild time" value={ms(a.regen_p50_ms)} />
+              <Field label="spent" value={usd(a.cost_usd, 3)} />
             </div>
           </div>
         ))}
+      </div>
+    </Panel>
+  )
+}
+
+export function EnginePanel({ frame }) {
+  const e = frame?.engine ?? {}
+  const offered = (e.admissions ?? 0) + (e.admissions_rejected ?? 0)
+  return (
+    <Panel
+      title="Engine internals"
+      subtitle="What the decision path is actually doing."
+    >
+      <div className="grid grid-cols-2 gap-3">
+        <Metric label="Objects kept" value={Number(e.admissions ?? 0).toLocaleString()} size="sm"
+          explain={offered ? `of ${offered.toLocaleString()} offered` : undefined} />
+        <Metric label="Objects refused" value={Number(e.admissions_rejected ?? 0).toLocaleString()} size="sm"
+          explain="not worth the space they would take" />
+        <Metric label="Evictions" value={Number(e.evictions ?? 0).toLocaleString()} size="sm"
+          explain="dropped to make room for something better" />
+        <Metric label="Resident objects" value={Number(e.resident_objects ?? 0).toLocaleString()} size="sm"
+          explain="currently in the cache" />
+        <Metric label="Model calls" value={Number(e.inference_calls ?? 0).toLocaleString()} size="sm"
+          explain="only on the write path, never on a read" />
+        <Metric label="Decision cost" value={`${Number(e.decision_overhead_us_p50 ?? 0).toFixed(1)}`} unit="µs" size="sm"
+          explain="median time to decide, write path only" />
       </div>
     </Panel>
   )
@@ -309,16 +511,16 @@ export function ApplicationsPanel({ frame }) {
 export function EventsPanel({ frame }) {
   const events = frame?.events ?? []
   return (
-    <Panel title="Events" className="h-full">
-      <div className="max-h-56 space-y-1 overflow-y-auto pr-1">
-        {events.length === 0 && <p className="text-xs text-muted-foreground">quiet</p>}
+    <Panel title="Event log" subtitle="Capacity changes, policy shifts and injected disturbances.">
+      <div className="max-h-64 space-y-1.5 overflow-y-auto pr-1">
+        {events.length === 0 && <p className="text-[13px] text-muted-foreground">Quiet.</p>}
         {events.map((e, i) => (
-          <div key={`${e.t}-${i}`} className="flex gap-2 text-[11px]">
-            <span className="shrink-0 font-mono text-muted-foreground">
+          <div key={`${e.t}-${i}`} className="flex gap-2.5 text-[12px]">
+            <span className="w-14 shrink-0 text-right font-mono text-muted-foreground">
               {(e.t / 1000).toFixed(1)}s
             </span>
-            <span className="shrink-0 font-medium">{e.kind}</span>
-            <span className="truncate text-muted-foreground">{e.detail}</span>
+            <span className="w-24 shrink-0 font-medium">{e.kind}</span>
+            <span className="text-muted-foreground">{e.detail}</span>
           </div>
         ))}
       </div>
@@ -327,17 +529,17 @@ export function EventsPanel({ frame }) {
 }
 
 const ATTACKS = [
-  "FlashCrowd",
-  "Scan",
-  "PopularityShift",
-  "CostSpike",
-  "ExpensiveTail",
-  "HotKeyEmergence",
-  "WorkingSetExplosion",
-  "MixedChaos",
+  { id: "FlashCrowd", label: "Flash crowd", hint: "traffic collapses onto a few keys" },
+  { id: "Scan", label: "Scan", hint: "a sweep of one-off keys tries to flush the cache" },
+  { id: "PopularityShift", label: "Popularity shift", hint: "the hot set is replaced" },
+  { id: "CostSpike", label: "Cost spike", hint: "rebuilding gets much more expensive" },
+  { id: "ExpensiveTail", label: "Expensive tail", hint: "the rare objects become the costly ones" },
+  { id: "HotKeyEmergence", label: "Hot key appears", hint: "a cold key becomes the hottest" },
+  { id: "WorkingSetExplosion", label: "Working set grows", hint: "more distinct keys than fit" },
+  { id: "MixedChaos", label: "Mixed chaos", hint: "several at once" },
 ]
 
-export function Controls({ frame, send }) {
+export function Controls({ frame, send, status }) {
   const [scenarios, setScenarios] = useState([])
   const [busy, setBusy] = useState(null)
   const sim = frame?.sim ?? {}
@@ -353,55 +555,92 @@ export function Controls({ frame, send }) {
     if (!send({ type: "attack", attack, duration_s: 25 })) {
       await post("/v1/sim/attack", { attack, duration_s: 25 })
     }
-    setTimeout(() => setBusy(null), 600)
+    setTimeout(() => setBusy(null), 900)
   }
+
+  const current = scenarios.find((s) => s.id === sim.scenario)
 
   return (
     <Panel
-      title="Scenario"
-      subtitle="Disturb the workload and watch the policy and capacity respond."
+      title="Drive the demo"
+      subtitle="Pick a traffic pattern, then throw a disturbance at it and watch the policy blend and pool size react."
+      actions={
+        <div className="flex items-center gap-2">
+          <Pill tone={sim.running ? "good" : "warn"}>
+            {sim.running ? "running" : "paused"}
+          </Pill>
+          <Pill>{Number(sim.rps ?? 0).toLocaleString()} req/s</Pill>
+        </div>
+      }
+      footer={current?.description}
     >
-      <div className="flex flex-wrap items-center gap-2">
-        <select
-          className="h-8 rounded-md border border-border bg-background px-2 text-xs"
-          value={sim.scenario ?? ""}
-          onChange={(e) => post("/v1/sim/start", { scenario: e.target.value, speed: sim.speed ?? 1 })}
-        >
-          {scenarios.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.name}
-            </option>
-          ))}
-        </select>
-        <div className="flex items-center gap-1">
-          {[1, 2, 4, 8].map((s) => (
-            <Button
-              key={s}
-              size="sm"
-              variant={sim.speed === s ? "default" : "outline"}
-              onClick={() => {
-                if (!send({ type: "speed", speed: s })) post("/v1/sim/speed", { speed: s })
-              }}
-            >
-              {s}x
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-col gap-1">
+          <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+            Traffic pattern
+          </label>
+          <select
+            className="h-9 min-w-52 rounded-lg border border-border bg-background px-2.5 text-[13px]"
+            value={sim.scenario ?? ""}
+            onChange={(e) => post("/v1/sim/start", { scenario: e.target.value, speed: sim.speed ?? 1 })}
+            disabled={status === "offline"}
+          >
+            {scenarios.length === 0 && <option>engine offline</option>}
+            {scenarios.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+            Speed
+          </label>
+          <div className="flex items-center gap-1">
+            {[1, 2, 4, 8].map((s) => (
+              <Button
+                key={s}
+                size="sm"
+                variant={sim.speed === s ? "default" : "outline"}
+                onClick={() => {
+                  if (!send({ type: "speed", speed: s })) post("/v1/sim/speed", { speed: s })
+                }}
+              >
+                {s}x
+              </Button>
+            ))}
+            <Button size="sm" variant="secondary" className="ml-1" onClick={() => post("/v1/sim/stop")}>
+              Pause
             </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+          Throw a disturbance
+        </label>
+        <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+          {ATTACKS.map((a) => (
+            <button
+              key={a.id}
+              onClick={() => fire(a.id)}
+              disabled={status === "offline"}
+              className={cn(
+                "rounded-xl border px-3 py-2 text-left transition-colors disabled:opacity-40",
+                busy === a.id
+                  ? "border-primary bg-primary/10"
+                  : "border-border/70 bg-background/40 hover:border-primary/50 hover:bg-accent/40"
+              )}
+            >
+              <div className="text-[12.5px] font-medium">{a.label}</div>
+              <div className="mt-0.5 text-[11px] leading-tight text-muted-foreground">
+                {a.hint}
+              </div>
+            </button>
           ))}
         </div>
-        <Button size="sm" variant="secondary" onClick={() => post("/v1/sim/stop")}>
-          Pause
-        </Button>
-      </div>
-      <div className="mt-3 flex flex-wrap gap-1.5">
-        {ATTACKS.map((a) => (
-          <Button
-            key={a}
-            size="sm"
-            variant={busy === a ? "default" : "outline"}
-            onClick={() => fire(a)}
-          >
-            {a}
-          </Button>
-        ))}
       </div>
     </Panel>
   )
@@ -435,44 +674,55 @@ export function BenchPanel() {
 
   return (
     <Panel
-      title="Benchmark"
-      subtitle="Offline replay of one stream through every policy, plus the Belady ceiling."
+      title="Head to head benchmark"
+      subtitle="Replays one fixed request stream through every policy offline, so the comparison is not affected by timing or luck. Belady is the offline optimum: no online policy can beat it."
       actions={
         <div className="flex items-center gap-2">
           <select
-            className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+            className="h-9 rounded-lg border border-border bg-background px-2.5 text-[13px]"
             value={scenario}
             onChange={(e) => setScenario(e.target.value)}
           >
-            {["expensive_tail", "scan_resistance", "flash_crowd", "shifting_popularity", "mixed_production", "steady_zipf"].map(
-              (s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              )
-            )}
+            {[
+              "expensive_tail",
+              "scan_resistance",
+              "flash_crowd",
+              "shifting_popularity",
+              "mixed_production",
+              "steady_zipf",
+            ].map((s) => (
+              <option key={s} value={s}>
+                {s.replace(/_/g, " ")}
+              </option>
+            ))}
           </select>
           <Button size="sm" onClick={run} disabled={running}>
-            {running ? "Running…" : "Run"}
+            {running ? "Running…" : "Run benchmark"}
           </Button>
         </div>
       }
+      footer={
+        report
+          ? "Results are also published to Supabase when the engine has credentials."
+          : "Takes a few seconds. 60,000 requests through five policies plus the optimal bound."
+      }
     >
       {!report && (
-        <p className="text-xs text-muted-foreground">
-          Runs in process and takes a few seconds. Every policy sees the identical stream.
-        </p>
+        <div className="flex h-40 items-center justify-center rounded-xl border border-dashed border-border/60 text-[13px] text-muted-foreground">
+          Press run to compare the policies.
+        </div>
       )}
       {report && (
         <div className="overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead className="text-muted-foreground">
-              <tr className="border-b border-border">
-                <th className="py-1.5 text-left font-medium">policy</th>
-                <th className="py-1.5 text-right font-medium">hit</th>
-                <th className="py-1.5 text-right font-medium">byte hit</th>
-                <th className="py-1.5 text-right font-medium">p95</th>
-                <th className="py-1.5 text-right font-medium">cost</th>
+          <table className="w-full text-[13px]">
+            <thead>
+              <tr className="border-b border-border text-[11px] uppercase tracking-wide text-muted-foreground">
+                <th className="py-2 text-left font-medium">Policy</th>
+                <th className="py-2 text-right font-medium">Hit rate</th>
+                <th className="py-2 text-right font-medium">Byte hit rate</th>
+                <th className="py-2 text-right font-medium">p95</th>
+                <th className="py-2 text-right font-medium">Backend calls</th>
+                <th className="py-2 text-right font-medium">Total cost</th>
               </tr>
             </thead>
             <tbody className="font-mono tabular-nums">
@@ -484,30 +734,91 @@ export function BenchPanel() {
                     r.policy === best?.policy && "bg-primary/5 font-semibold text-primary"
                   )}
                 >
-                  <td className="py-1.5 text-left">{r.policy}</td>
-                  <td className="py-1.5 text-right">{pct(r.object_hit_rate)}</td>
-                  <td className="py-1.5 text-right">{pct(r.byte_hit_rate)}</td>
-                  <td className="py-1.5 text-right">{ms(r.p95_latency_ms)}</td>
-                  <td className="py-1.5 text-right">{usd(r.total_cost_usd)}</td>
+                  <td className="py-2 text-left">{r.policy}</td>
+                  <td className="py-2 text-right">{pct(r.object_hit_rate)}</td>
+                  <td className="py-2 text-right">{pct(r.byte_hit_rate)}</td>
+                  <td className="py-2 text-right">{ms(r.p95_latency_ms)}</td>
+                  <td className="py-2 text-right">{Number(r.backend_requests).toLocaleString()}</td>
+                  <td className="py-2 text-right">{usd(r.total_cost_usd)}</td>
                 </tr>
               ))}
               <tr className="text-muted-foreground">
-                <td className="py-1.5 text-left">belady</td>
-                <td className="py-1.5 text-right">{pct(report.belady_upper_bound?.object_hit_rate ?? 0)}</td>
-                <td className="py-1.5 text-right">—</td>
-                <td className="py-1.5 text-right">—</td>
-                <td className="py-1.5 text-right">{usd(report.belady_upper_bound?.total_cost_usd ?? 0)}</td>
+                <td className="py-2 text-left">belady (optimal)</td>
+                <td className="py-2 text-right">{pct(report.belady_upper_bound?.object_hit_rate ?? 0)}</td>
+                <td className="py-2 text-right">—</td>
+                <td className="py-2 text-right">—</td>
+                <td className="py-2 text-right">—</td>
+                <td className="py-2 text-right">{usd(report.belady_upper_bound?.total_cost_usd ?? 0)}</td>
               </tr>
             </tbody>
           </table>
-          <p className="mt-2 text-[11px] text-muted-foreground">
-            Winner <span className="font-medium text-foreground">{report.winner}</span>.{" "}
-            {Object.entries(report.improvement_vs ?? {})
-              .map(([k, v]) => `${pct(v, 1)} cheaper than ${k}`)
-              .join(", ")}
-          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Pill tone="good">winner: {report.winner}</Pill>
+            {Object.entries(report.improvement_vs ?? {}).map(([k, v]) => (
+              <Pill key={k} tone={v > 0 ? "accent" : "bad"}>
+                {pct(v, 1)} vs {k}
+              </Pill>
+            ))}
+          </div>
         </div>
       )}
     </Panel>
+  )
+}
+
+/// Shows what Supabase is and is not doing. The distinction matters: people assume a
+/// database behind a cache is on the request path, and here it deliberately is not.
+export function SupabasePanel() {
+  const [state, setState] = useState(null)
+
+  useEffect(() => {
+    const load = () => get("/v1/supabase").then(setState).catch(() => setState(null))
+    load()
+    const id = setInterval(load, 15000)
+    return () => clearInterval(id)
+  }, [])
+
+  const tone = !state?.configured ? "warn" : state.reachable ? "good" : "bad"
+  const label = !state?.configured
+    ? "not configured"
+    : state.reachable
+      ? "connected"
+      : "configured but unreachable"
+
+  return (
+    <Panel
+      title="Supabase"
+      subtitle="Model registry, benchmark history and events."
+      actions={<Pill tone={tone}>{label}</Pill>}
+    >
+      <div className="space-y-2 text-[12.5px]">
+        <Row label="Active models" value={
+          state?.active_models?.length ? state.active_models.join(", ") : "none published yet"
+        } />
+        <Row label="Benchmark runs" value="published automatically after each run" />
+        <Row label="Cache reads" value="never — the data path does not touch Postgres" />
+      </div>
+      <p className="mt-3 text-[12px] leading-snug text-muted-foreground">
+        On a miss it is the application service that queries Supabase and reports what that
+        query cost. The cache learns from that measured cost. Putting Postgres in front of
+        every read would defeat the purpose of a cache.
+      </p>
+      {!state?.configured && (
+        <p className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px]">
+          Set <code className="font-mono">SUPABASE_URL</code> and{" "}
+          <code className="font-mono">SUPABASE_SERVICE_ROLE_SECRET_KEY</code> in{" "}
+          <code className="font-mono">backend/.env</code>, then restart the engine.
+        </p>
+      )}
+    </Panel>
+  )
+}
+
+function Row({ label, value }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 border-b border-border/40 pb-1.5">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="text-right font-mono text-[12px]">{value}</span>
+    </div>
   )
 }
