@@ -56,27 +56,38 @@ pub struct QuantileLadder {
     levels: [f64; 6],
     lr: f64,
     seen: u64,
+    /// Running mean magnitude of the observations, used only to floor the step size.
+    ///
+    /// The step is multiplicative (`lr x |level|`), which is scale-free by construction —
+    /// but a level sitting at exactly zero would then never move. A fixed floor of 1.0 is
+    /// the obvious fix and is wrong: 1.0 is enormous next to a cost of 0.000002 and
+    /// negligible next to a latency of 2000, so the ladder converges at one scale and not
+    /// the other. Flooring against the data's own magnitude keeps it scale-free.
+    mean_abs: f64,
 }
 
 impl Default for QuantileLadder {
     fn default() -> Self {
-        Self { levels: [0.0; 6], lr: 0.02, seen: 0 }
+        Self { levels: [0.0; 6], lr: 0.02, seen: 0, mean_abs: 0.0 }
     }
 }
 
 impl QuantileLadder {
     pub fn new(lr: f64) -> Self {
-        Self { levels: [0.0; 6], lr, seen: 0 }
+        Self { levels: [0.0; 6], lr, seen: 0, mean_abs: 0.0 }
     }
 
     pub fn observe(&mut self, x: f64) {
         if self.seen == 0 {
             self.levels = [x; 6];
+            self.mean_abs = x.abs();
             self.seen = 1;
             return;
         }
+        self.mean_abs = 0.05 * x.abs() + 0.95 * self.mean_abs;
+        let floor = if self.mean_abs > 0.0 { self.mean_abs * 1e-3 } else { f64::MIN_POSITIVE };
         for i in 0..LADDER.len() {
-            let step = self.lr * self.levels[i].abs().max(1.0);
+            let step = self.lr * self.levels[i].abs().max(floor);
             self.levels[i] += if x > self.levels[i] {
                 step * LADDER[i]
             } else {
@@ -457,28 +468,38 @@ mod tests {
 
     #[test]
     fn cost_percentile_is_scale_free() {
-        // The same *relative* cost structure at two wildly different absolute scales must
-        // produce the same percentile. This is the property that makes the feature portable.
-        let costs_cheap: Vec<f64> = (1..=200).map(|i| i as f64 * 0.000_001).collect();
-        let costs_dear: Vec<f64> = (1..=200).map(|i| i as f64 * 0.1).collect();
-
-        let mut a = builder();
-        for (i, c) in costs_cheap.iter().enumerate() {
-            a.transform(i as u64, i as f64, "app", 1000, *c, 10.0);
+        // The property that lets `cost_percentile` replace absolute cost in the model.
+        // The same relative distribution at wildly different absolute scales must produce
+        // the same percentile, or a model trained on one deployment is worthless on
+        // another — silently, which is the dangerous part.
+        //
+        // A lognormal spread is used rather than a monotone ramp: a streaming estimator
+        // trails a ramp by construction, and testing against one measures lag rather than
+        // scale-invariance.
+        fn percentile_at_scale(scale: f64) -> f64 {
+            let mut rng = crate::rng::Rng::seed_from_u64(7);
+            let mut b = builder();
+            let mut values: Vec<f64> = (0..4_000).map(|_| rng.log_normal(0.0, 1.0) * scale).collect();
+            for (i, v) in values.iter().enumerate() {
+                b.transform(i as u64, i as f64, "app", 1_000, *v, 10.0);
+            }
+            values.sort_by(|a, c| a.partial_cmp(c).unwrap());
+            let probe = values[(values.len() as f64 * 0.8) as usize];
+            b.transform(999_999, 9_999.0, "app", 1_000, probe, 10.0)[COST_PCT]
         }
-        let pct_a = a.transform(9999, 500.0, "app", 1000, 180.0 * 0.000_001, 10.0)[COST_PCT];
 
-        let mut d = builder();
-        for (i, c) in costs_dear.iter().enumerate() {
-            d.transform(i as u64, i as f64, "app", 1000, *c, 10.0);
-        }
-        let pct_d = d.transform(9999, 500.0, "app", 1000, 180.0 * 0.1, 10.0)[COST_PCT];
+        let cents = percentile_at_scale(1e-6);      // dollars per rebuild
+        let scaled = percentile_at_scale(0.1);      // the same shape, 100,000x larger
+        let millis = percentile_at_scale(200.0);    // and again, as if it were milliseconds
 
         assert!(
-            (pct_a - pct_d).abs() < 0.12,
-            "the same relative cost gave different percentiles across scales: {pct_a} vs {pct_d}"
+            (cents - scaled).abs() < 0.05 && (cents - millis).abs() < 0.05,
+            "percentile drifted across scales: {cents:.3} / {scaled:.3} / {millis:.3}"
         );
-        assert!(pct_a > 0.6, "the 180th of 200 values should sit high, got {pct_a}");
+        assert!(
+            (cents - 0.8).abs() < 0.08,
+            "the true 80th percentile should read near 0.8, got {cents:.3}"
+        );
     }
 
     #[test]

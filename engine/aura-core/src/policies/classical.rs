@@ -286,8 +286,19 @@ impl Lfu {
     }
 
     fn evict_until_fits(&mut self, needed: u64, evicted: &mut Vec<KeyId>) {
-        while self.used_bytes + needed > self.capacity_bytes {
-            let Some(item) = self.heap.pop() else { break };
+        while self.used_bytes + needed > self.capacity_bytes && !self.entries.is_empty() {
+            let Some(item) = self.heap.pop() else {
+                // Stale records can drain the heap while entries remain.
+                let snapshot: Vec<(KeyId, u32)> =
+                    self.entries.iter().map(|(k, e)| (*k, e.freq)).collect();
+                if snapshot.is_empty() {
+                    break;
+                }
+                for (key, freq) in snapshot {
+                    self.push(key, freq);
+                }
+                continue;
+            };
             let Some(entry) = self.entries.get(&item.key) else { continue };
             // A key can appear in the heap several times; only the record matching the
             // current frequency is authoritative.
@@ -323,6 +334,9 @@ impl Lfu {
             return result;
         }
         self.evict_until_fits(req.size_bytes, &mut result.evicted);
+        if self.used_bytes + req.size_bytes > self.capacity_bytes {
+            return result;
+        }
         self.entries.insert(req.key, Resident::new(req, 0, 0.0));
         self.used_bytes += req.size_bytes;
         self.push(req.key, 1);
@@ -441,9 +455,22 @@ impl Gdsf {
         self
     }
 
-    fn priority(&self, entry: &Resident) -> f64 {
+    /// Computed when the object is admitted and again on each hit, because a hit changes
+    /// `freq`. Stored on the entry rather than recomputed during eviction: `L` is a floor
+    /// for new arrivals, and recomputing every resident against the current `L` would add
+    /// it to all of them equally and cancel the term out.
+    fn priority_now(&self, entry: &Resident) -> f64 {
         let cost = if entry.cost_usd > 0.0 { entry.cost_usd } else { self.default_cost_usd };
         self.inflation + (entry.freq as f64) * cost / (entry.size_bytes.max(1) as f64)
+    }
+
+    fn rebuild_heap(&mut self) {
+        self.heap.clear();
+        let snapshot: Vec<(KeyId, f64)> =
+            self.entries.iter().map(|(k, e)| (*k, e.score)).collect();
+        for (key, score) in snapshot {
+            self.push(key, score);
+        }
     }
 
     fn push(&mut self, key: KeyId, priority: f64) {
@@ -452,18 +479,24 @@ impl Gdsf {
     }
 
     fn evict_until_fits(&mut self, needed: u64, evicted: &mut Vec<KeyId>) {
-        while self.used_bytes + needed > self.capacity_bytes {
-            let Some(item) = self.heap.pop() else { break };
+        while self.used_bytes + needed > self.capacity_bytes && !self.entries.is_empty() {
+            let Some(item) = self.heap.pop() else {
+                // Lazy deletion can drain the heap while entries remain. Rebuilding is O(n)
+                // and rare; exceeding the byte budget is neither acceptable nor recoverable.
+                self.rebuild_heap();
+                if self.heap.is_empty() {
+                    break;
+                }
+                continue;
+            };
             let Some(entry) = self.entries.get(&item.key) else { continue };
-            let current = self.priority(entry);
-            // Skip records that no longer describe the entry's current priority.
-            if (-item.score - current).abs() > 1e-12 {
+            // Skip records that no longer describe the entry's stored priority.
+            if (-item.score - entry.score).abs() > 1e-12 {
                 continue;
             }
             let size = entry.size_bytes;
-            // The evicted object's priority becomes the inflation floor: nothing already
-            // resident can now be worth less than what we just gave up.
-            self.inflation = current;
+            // The evicted object's priority becomes the floor for later arrivals.
+            self.inflation = entry.score;
             self.entries.remove(&item.key);
             self.used_bytes -= size;
             evicted.push(item.key);
@@ -476,9 +509,13 @@ impl Gdsf {
             return result;
         }
         self.evict_until_fits(req.size_bytes, &mut result.evicted);
+        if self.used_bytes + req.size_bytes > self.capacity_bytes {
+            return result;
+        }
         let cost = self.pricing.regen_cost_usd(&req.regen);
-        let entry = Resident::new(req, 0, cost);
-        let priority = self.priority(&entry);
+        let mut entry = Resident::new(req, 0, cost);
+        entry.score = self.priority_now(&entry);
+        let priority = entry.score;
         self.entries.insert(req.key, entry);
         self.used_bytes += req.size_bytes;
         self.push(req.key, priority);
@@ -498,7 +535,10 @@ impl CachePolicy for Gdsf {
                 entry.freq += 1;
                 entry.last_ts_ms = req.ts_ms;
                 let snapshot = *entry;
-                let priority = self.priority(&snapshot);
+                let priority = self.priority_now(&snapshot);
+                if let Some(e) = self.entries.get_mut(&req.key) {
+                    e.score = priority;
+                }
                 self.push(req.key, priority);
                 return AccessResult::hit();
             }

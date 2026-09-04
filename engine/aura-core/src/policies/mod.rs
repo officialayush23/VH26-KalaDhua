@@ -140,6 +140,14 @@ pub struct Resident {
     /// Priced regeneration cost, carried so cost-aware policies do not have to re-derive
     /// it and so eviction can attribute a saving.
     pub cost_usd: f64,
+    /// Priority assigned when the object was admitted or last promoted.
+    ///
+    /// Greedy-Dual policies **must** store this rather than recompute it. Their inflation
+    /// term `L` rises as objects are evicted, and if every resident's priority were
+    /// recomputed against the current `L`, the term would be added to all of them equally
+    /// and cancel out entirely — leaving an expensive object immortal, which is the exact
+    /// failure the inflation term exists to prevent.
+    pub score: f64,
 }
 
 impl Resident {
@@ -152,6 +160,7 @@ impl Resident {
             freq: 1,
             last_ts_ms: req.ts_ms,
             cost_usd,
+            score: 0.0,
         }
     }
 
