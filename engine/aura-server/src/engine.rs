@@ -15,6 +15,7 @@ use crate::consistency::{
 use crate::feedback::{Journal, JournalStats, TrainingRow};
 use crate::policy::{round4, Bandit, Policy, Regime, WorkloadFeatures};
 use crate::predictor::Predictor;
+use crate::profiles::ProfileStore;
 use crate::store::{Entry, Store};
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,6 +227,13 @@ impl Shadow {
 pub struct Engine {
     pub cfg: Config,
     pub store: Store,
+    /// What each application asked the cache to optimise for. Read on every write; the
+    /// lookup falls back to the global defaults, so an unconfigured application costs
+    /// nothing extra.
+    pub profiles: ProfileStore,
+    /// Bytes each application currently holds. Maintained at the two places residency
+    /// changes rather than counted on demand, because counting it means walking the pool.
+    pub resident_bytes: AHashMap<String, u64>,
     pub features: FeatureBuilder,
     /// The eight extra signals. Separate from `features` because they carry
     /// per-application distributions rather than per-key counters.
@@ -297,6 +305,8 @@ impl Engine {
             .map(|p| Shadow::new(*p, capacity))
             .collect();
         Self {
+            profiles: ProfileStore::new(&cfg),
+            resident_bytes: AHashMap::new(),
             cfg,
             store,
             features,
@@ -496,10 +506,13 @@ impl Engine {
         self.ledger.backend_usd += cost_usd;
         self.ledger.no_cache_usd += cost_usd;
         if latency > self.cfg.pricing.slo_p95_ms {
-            self.ledger.sla_penalty_usd += self
-                .cfg
-                .pricing
-                .sla_penalty_usd(latency - self.cfg.pricing.slo_p95_ms, ctx.sla_class.penalty_weight());
+            // Charged at this application's own weight: an application that says being slow
+            // hurts it more is billed for it, which is what makes the knob mean something
+            // rather than being a display preference.
+            let weight =
+                ctx.sla_class.penalty_weight() * self.profiles.get(&ctx.application).sla_weight;
+            self.ledger.sla_penalty_usd +=
+                self.cfg.pricing.sla_penalty_usd(latency - self.cfg.pricing.slo_p95_ms, weight);
         }
         self.push_latency(latency);
 
@@ -575,13 +588,31 @@ impl Engine {
         f[EXTRA_OFFSET..].copy_from_slice(&extra);
 
         let reuse = self.predictor.reuse(&f);
-        let value_density = self.value_density(&f, reuse, ctx.size_bytes, cost_usd);
+        let value_density = self.value_density(&f, reuse, ctx.size_bytes, cost_usd, &ctx.application);
         // The bar for admission is the object that would have to be evicted to make room,
         // not a running average of what has been arriving. Comparing an arrival against
         // the mean of other arrivals rejects the bottom half of the stream no matter how
         // valuable it is, and leaves capacity unused.
         let victim_bar = self.victim_bar(ctx.size_bytes, now_ms);
-        let threshold = victim_bar * self.cfg.engine.admission_margin;
+        let profile = *self.profiles.get(&ctx.application);
+        // An application over its share of the pool does not stop being admitted; it has to
+        // be better to get in. A hard cap would evict an expensive object to make room for a
+        // worthless one belonging to a quieter application, which is not fairness.
+        let share_penalty = {
+            let cap = self.store.capacity_bytes();
+            let held = *self.resident_bytes.get(&ctx.application).unwrap_or(&0);
+            if cap > 0 && profile.max_pool_share < 1.0 {
+                let share = held as f64 / cap as f64;
+                if share > profile.max_pool_share {
+                    1.0 + (share - profile.max_pool_share) * 4.0
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            }
+        };
+        let threshold = victim_bar * profile.admission_margin * share_penalty;
         self.eviction_threshold = victim_bar;
 
         let too_big = ctx.size_bytes > self.store.capacity_bytes() / 4;
@@ -618,6 +649,7 @@ impl Engine {
                     hits: 0,
                     score: value_density,
                 });
+                *self.resident_bytes.entry(ctx.application.clone()).or_insert(0) += ctx.size_bytes;
                 self.ledger.cache_usd += self.cfg.pricing.holding_cost_usd(
                     ctx.size_bytes as f64,
                     ctx.ttl_ms.unwrap_or(60_000.0).min(600_000.0),
@@ -678,10 +710,21 @@ impl Engine {
 
     /// Economic value per byte per second of occupancy. This is the single number every
     /// admission and eviction is decided on, and the only place cost, reuse and size meet.
-    pub fn value_density(&self, f: &Features, reuse: [f64; 3], size_bytes: u64, cost_usd: f64) -> f64 {
-        let w = self.cfg.engine.horizon_weights;
+    pub fn value_density(
+        &self,
+        f: &Features,
+        reuse: [f64; 3],
+        size_bytes: u64,
+        cost_usd: f64,
+        application: &str,
+    ) -> f64 {
+        // The profile shapes the arithmetic around the prediction, never the prediction
+        // itself: `reuse` arrives here exactly as the model produced it.
+        let profile = self.profiles.get(application);
+        let w = profile.horizon_weights;
         let expected_reuses = reuse[0] * w[0] * 6.0 + reuse[1] * w[1] * 2.0 + reuse[2] * w[2];
-        let sla_weight = 1.0 + f[idx::COST_VARIANCE_RATIO].min(4.0) * self.cfg.engine.tail_risk_lambda;
+        let risk = 1.0 + f[idx::COST_VARIANCE_RATIO].min(4.0) * profile.tail_risk_lambda;
+        let sla_weight = risk * profile.sla_weight.max(0.05);
         let value = cost_usd * expected_reuses * sla_weight;
         let hold = self
             .cfg
@@ -738,6 +781,9 @@ impl Engine {
             _ => self.store.remove(key),
         };
         let Some(e) = removed else { return };
+        if let Some(held) = self.resident_bytes.get_mut(&e.application) {
+            *held = held.saturating_sub(e.size_bytes);
+        }
         if reason == Removal::Expired {
             self.store.expirations += 1;
         }
@@ -875,7 +921,8 @@ impl Engine {
         let blended = |model: f64| expert_reuse * (1.0 - share) + model * share;
         let reuse = [blended(model_reuse[0]), blended(model_reuse[1]), blended(model_reuse[2])];
 
-        self.value_density(&f, reuse, e.size_bytes, cost) * e.ttl_remaining_frac(now_ms).max(0.05)
+        self.value_density(&f, reuse, e.size_bytes, cost, &e.application)
+            * e.ttl_remaining_frac(now_ms).max(0.05)
     }
 
     /// The reuse estimate for a resident object, without recording an access.

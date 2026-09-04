@@ -88,12 +88,18 @@ export function FlowDiagram({ frame, status }) {
   const flight = consistency.single_flight ?? {}
   const liveTraffic = fidelity.traffic === "applications"
 
+  // The spawn loop runs on an interval outside React's render cycle, so it reads the
+  // proportions through refs. They are written in an effect rather than during render:
+  // a render can be thrown away and re-run, and the animation must not see a value the
+  // page never committed.
   const hitRef = useRef(hitFrac)
-  hitRef.current = hitFrac
   const l1Ref = useRef(l1Frac)
-  l1Ref.current = l1Frac
   const liveRef = useRef(status === "live" || status === "polling")
-  liveRef.current = status === "live" || status === "polling"
+  useEffect(() => {
+    hitRef.current = hitFrac
+    l1Ref.current = l1Frac
+    liveRef.current = status === "live" || status === "polling"
+  }, [hitFrac, l1Frac, status])
 
   useEffect(() => {
     const host = hostRef.current

@@ -8,6 +8,7 @@ mod engine;
 mod feedback;
 mod policy;
 mod predictor;
+mod profiles;
 mod store;
 mod supabase;
 
@@ -292,6 +293,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/capacity", get(capacity_get))
         .route("/v1/capacity/mode", post(capacity_mode))
         .route("/v1/applications", get(applications))
+        .route("/v1/profiles", get(profiles_all))
+        .route("/v1/profiles/knobs", get(profiles_knobs))
+        .route(
+            "/v1/applications/:app/profile",
+            get(profile_get).put(profile_put).delete(profile_reset),
+        )
         .route("/v1/nodes", get(nodes))
         .route("/v1/model/reload", post(model_reload))
         .route("/v1/supabase", get(supabase_status))
@@ -1112,6 +1119,108 @@ async fn capacity_mode(State(app): State<Shared>, Json(body): Json<CapacityMode>
 async fn applications(State(app): State<Shared>) -> Json<Value> {
     let frame = build_frame(&app);
     Json(json!({ "profiles": frame.get("applications").cloned().unwrap_or(json!([])) }))
+}
+
+/// Every application the cache has seen, with the profile in force for it and whether that
+/// profile was set by an operator or is still the default.
+async fn profiles_all(State(app): State<Shared>) -> Json<Value> {
+    let eng = app.engine.lock();
+    let cap = eng.store.capacity_bytes().max(1);
+    let mut rows: Vec<Value> = eng
+        .apps
+        .keys()
+        .map(|name| {
+            let held = *eng.resident_bytes.get(name).unwrap_or(&0);
+            json!({
+                "application": name,
+                "customised": eng.profiles.is_customised(name),
+                "resident_bytes": held,
+                "pool_share": round4(held as f64 / cap as f64),
+                "profile": eng.profiles.get(name),
+            })
+        })
+        .collect();
+    // An application configured before it has sent a single request still has to appear, or
+    // the operator cannot pre-configure one.
+    for (name, profile) in eng.profiles.customised() {
+        if !eng.apps.contains_key(name) {
+            rows.push(json!({
+                "application": name,
+                "customised": true,
+                "resident_bytes": 0,
+                "pool_share": 0.0,
+                "profile": profile,
+            }));
+        }
+    }
+    rows.sort_by(|a, b| a["application"].as_str().cmp(&b["application"].as_str()));
+    Json(json!({ "defaults": eng.profiles.defaults(), "applications": rows }))
+}
+
+/// What each knob does, served from the engine so the dashboard cannot describe a control
+/// the engine does not have.
+async fn profiles_knobs() -> Json<Value> {
+    Json(profiles::knobs())
+}
+
+async fn profile_get(State(app): State<Shared>, Path(name): Path<String>) -> Json<Value> {
+    let eng = app.engine.lock();
+    Json(json!({
+        "application": name,
+        "customised": eng.profiles.is_customised(&name),
+        "profile": eng.profiles.get(&name),
+    }))
+}
+
+/// Partial update. Absent fields keep their current value, every number is clamped to a
+/// range the engine can run in, and the result is the profile as it now stands rather than
+/// an acknowledgement, so the dashboard renders what the engine actually accepted.
+async fn profile_put(
+    State(app): State<Shared>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let mut eng = app.engine.lock();
+    let profile = eng.profiles.patch(&name, &body);
+    let message = format!(
+        "{name} now optimises for {}: horizons {:.2}/{:.2}/{:.2}, admission bar {:.2}x, \
+         slow-response weight {:.1}x, refresh at {:.0}% of TTL, pool share cap {:.0}%.",
+        profile.objective.as_str(),
+        profile.horizon_weights[0],
+        profile.horizon_weights[1],
+        profile.horizon_weights[2],
+        profile.admission_margin,
+        profile.sla_weight,
+        profile.soft_ttl_fraction * 100.0,
+        profile.max_pool_share * 100.0,
+    );
+    let now = eng.now_ms;
+    eng.audit.record(
+        now,
+        crate::audit::AuditKind::PolicyShift,
+        crate::audit::Severity::Notice,
+        &name,
+        &name,
+        message,
+        vec![
+            crate::audit::Fact::new("objective", profile.objective.as_str()),
+            crate::audit::Fact::new("admission_margin", format!("{:.2}x", profile.admission_margin)),
+            crate::audit::Fact::new("sla_weight", format!("{:.1}x", profile.sla_weight)),
+        ],
+        0.0,
+    );
+    Json(json!({ "application": name, "customised": true, "profile": profile }))
+}
+
+async fn profile_reset(State(app): State<Shared>, Path(name): Path<String>) -> Json<Value> {
+    let mut eng = app.engine.lock();
+    let existed = eng.profiles.reset(&name);
+    Json(json!({
+        "application": name,
+        "customised": false,
+        "was_customised": existed,
+        "profile": eng.profiles.defaults(),
+    }))
 }
 
 async fn nodes(State(app): State<Shared>) -> Json<Value> {

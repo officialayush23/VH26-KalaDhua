@@ -18,6 +18,7 @@ import {
   SupabasePanel,
 } from "@/components/dashboard/panels"
 import { ActivityLog } from "@/components/dashboard/activity"
+import { ProfilesPanel } from "@/components/dashboard/profiles"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
 import { FlowDiagram } from "@/components/dashboard/flowdiagram"
 
@@ -34,6 +35,7 @@ const TABS = [
   { id: "overview", label: "Overview" },
   { id: "flow", label: "Request flow" },
   { id: "decisions", label: "Decisions" },
+  { id: "tuning", label: "Tuning" },
   { id: "benchmark", label: "Benchmark" },
   { id: "system", label: "Model & system" },
 ]
@@ -215,6 +217,13 @@ export function App() {
                 <PolicyPanel frame={frame} />
                 <EventsPanel frame={frame} />
               </div>
+            </div>
+          )}
+
+          {tab === "tuning" && (
+            <div className="space-y-4">
+              <ProfilesPanel frame={frame} />
+              <ApplicationsPanel frame={frame} />
             </div>
           )}
 
