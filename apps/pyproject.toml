@@ -1,0 +1,56 @@
+[project]
+name = "aura-apps"
+version = "0.1.0"
+description = "Example applications and client SDK for the AURA cache"
+requires-python = ">=3.11"
+dependencies = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "asyncpg>=0.29",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["common", "recommendation", "analytics", "content", "driver"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "ARG", "D"]
+ignore = [
+    "D203",   # incompatible with D211
+    "D213",   # incompatible with D212
+    "D401",   # imperative mood is not always the clearest phrasing
+    "D404",
+    "D107",  # __init__ is documented by its class docstring
+    "D105",  # dunder methods do not need their own prose
+    "B008",
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "ARG", "SLF001"]
+"*/main.py" = ["ARG001"]      # ASGI handlers always take a request
+"common/service.py" = ["ARG001", "ARG002"]
+"content/main.py" = ["ARG001", "ARG002"]
+"driver/run_universe.py" = ["ARG001"]
+"__init__.py" = ["D104"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["common", "recommendation", "analytics", "content", "driver"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

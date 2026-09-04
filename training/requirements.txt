@@ -1,0 +1,38 @@
+# AURA training pipeline, Python 3.11.
+#
+#   pip install -r requirements.txt
+#
+# Everything below is pinned to a lower bound rather than an exact version: the
+# pipeline is run in Colab as often as it is run locally, and Colab's preinstalled
+# numpy/pandas move faster than any pin would survive.
+
+# Core numerics. The pipeline runs on these alone.
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.4
+scipy>=1.11
+matplotlib>=3.8
+
+# Gradient boosting. LightGBM is the model we ship; if it is unavailable the
+# trainer falls back to scikit-learn's HistGradientBoosting and exports the
+# identical bundle format (see aura_train/train_gbdt.py).
+lightgbm>=4.3
+
+# Columnar shards. Without pyarrow the dataset builder writes gzipped CSV
+# shards instead, which is slower but functionally identical.
+pyarrow>=14.0
+
+# ONNX export. Optional: the JSON bundle is authoritative and the engine's
+# default path is the pure-Rust tree walker.
+onnx>=1.15
+onnxmltools>=1.12
+skl2onnx>=1.16
+onnxruntime>=1.17
+
+# Supabase. The SDK is preferred; supabase_io falls back to REST over requests.
+supabase>=2.4
+requests>=2.31
+
+# Development.
+ruff>=0.4
+pytest>=8.0

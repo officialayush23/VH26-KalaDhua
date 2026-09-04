@@ -1,0 +1,73 @@
+[project]
+name = "aura-train"
+version = "0.1.0"
+description = "Training pipeline for the AURA adaptive cache: traces in, model bundles out"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scikit-learn>=1.4",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+gbdt = ["lightgbm>=4.3"]
+parquet = ["pyarrow>=14.0"]
+onnx = ["onnx>=1.15", "onnxmltools>=1.12", "skl2onnx>=1.16", "onnxruntime>=1.17"]
+supabase = ["supabase>=2.4", "requests>=2.31"]
+dev = ["ruff>=0.4", "pytest>=8.0"]
+
+[project.scripts]
+aura-train = "aura_train.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["aura_train"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # warnings
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RET",  # return
+    "ARG",  # unused arguments
+    "PTH",  # pathlib over os.path
+    "T20",  # no print in library code
+    "ANN",  # type annotations
+    "SLF",  # private member access
+    "BLE",  # blind except
+]
+ignore = [
+    "ANN401",  # Any is legitimate for the pickle and SDK boundaries
+    "B008",    # dataclass field defaults read better inline
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The CLI is the one place that is allowed to print: it is the user interface.
+"aura_train/cli.py" = ["T20"]
+# Scripts are entry points, so they print and they take untyped argv.
+"scripts/*.py" = ["T20", "ANN"]
+# Tests assert against private helpers and print their own results.
+"tests/*.py" = ["T20", "ANN", "SLF", "E402", "BLE"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aura_train"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,18 @@
+# Runtime dependencies for the AURA example applications.
+#
+# The services are built on Starlette, the ASGI layer FastAPI is itself built
+# on, with pydantic v2 doing request and settings validation.
+starlette>=0.37
+uvicorn>=0.30
+httpx>=0.27
+pydantic>=2.6
+pydantic-settings>=2.2
+numpy>=1.26
+
+# Only needed when the analytics app talks to Supabase Postgres. Without it the
+# app falls back to its local SQLite fixture and still runs.
+asyncpg>=0.29
+
+# Development
+pytest>=8.0
+ruff>=0.5

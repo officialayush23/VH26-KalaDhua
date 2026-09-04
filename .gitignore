@@ -1,0 +1,75 @@
+# --- planning / internal documents (not for the public repo) ---
+Build_plan&Reasoning..docx
+~$*.docx
+*.docx
+docs/*.pdf
+docs/**/*.pdf
+*.pdf
+
+# --- secrets ---
+.env
+.env.*
+!.env.example
+**/.env
+!**/.env.example
+*.pem
+*.key
+service_account*.json
+
+# --- rust ---
+target/
+**/target/
+*.rs.bk
+Cargo.lock.orig
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env-py/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+dist/
+build/
+
+# --- node / frontend ---
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+.eslintcache
+
+# --- data, traces, models, results ---
+data/
+traces/
+*.trace
+*.csv.gz
+*.parquet
+models/*.onnx
+models/*.json
+!models/.gitkeep
+artifacts/
+runs/
+results/*.csv
+!results/.gitkeep
+mlruns/
+
+# --- observability volumes ---
+deploy/volumes/
+prometheus_data/
+grafana_data/
+
+# --- editors / os ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
