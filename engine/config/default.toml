@@ -1,0 +1,69 @@
+# AURA engine configuration.
+#
+# Every key can be overridden at runtime with an environment variable named
+# AURA__SECTION__KEY, e.g. AURA__CACHE__CAPACITY_BYTES=1073741824.
+
+[cache]
+capacity_bytes = 536870912
+shards = 16
+
+[cache.l1]
+capacity_bytes = 33554432
+
+[cdn]
+enabled = true
+ttl_ms = 60000.0
+capacity_bytes = 134217728
+
+# USD price table. Mirrored in training/aura_train/config.py; regen_cost_usd is a model
+# feature, so these two must stay numerically identical.
+[pricing]
+cpu_ms_usd = 0.0000000116
+gpu_ms_usd = 0.000000255
+db_ms_usd = 0.0000000320
+network_gb_usd = 0.09
+cache_gb_hour_usd = 0.0225
+sla_penalty_per_ms_over_slo_usd = 0.0000004
+slo_p95_ms = 150.0
+
+# Baked into the feature builder. Changing anything here invalidates every trained model.
+[features]
+inter_arrival_alpha = 0.3
+freq_windows_ms = [60000.0, 300000.0, 3600000.0]
+half_life_fast_s = 5.0
+half_life_slow_s = 60.0
+trend_eps = 0.000001
+quantile_lr = 0.02
+
+[engine]
+candidate_sample = 32
+controller_tick_ms = 100.0
+admission_margin = 1.10
+refresh_ttl_threshold = 0.15
+ml_confidence_floor = 0.20
+horizon_weights = [0.5, 0.35, 0.15]
+tail_risk_lambda = 0.35
+
+[capacity]
+auto = true
+step_bytes = 268435456
+min_bytes = 134217728
+max_bytes = 4294967296
+host_budget_bytes = 2147483648
+roi_threshold = 1.25
+cooldown_s = 5.0
+
+[predictor]
+kind = "heuristic"
+supabase_autoload = false
+online_lr = 0.05
+
+[bandit]
+kind = "thompson"
+exploration = 0.08
+decision_interval_ms = 2000.0
+
+[ghost]
+sample_rate = 0.01
+buckets = 64
+max_probe_multiple = 4.0

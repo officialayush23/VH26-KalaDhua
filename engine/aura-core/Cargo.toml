@@ -1,0 +1,22 @@
+[package]
+name = "aura-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Adaptive utility and runtime-aware cache: decision engine, policies, economics and capacity control"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+parking_lot.workspace = true
+ahash.workspace = true
+tracing.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+rand_distr.workspace = true
+serde_json.workspace = true
