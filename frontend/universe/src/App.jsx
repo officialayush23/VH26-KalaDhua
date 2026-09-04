@@ -18,6 +18,7 @@ import {
   SupabasePanel,
 } from "@/components/dashboard/panels"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
+import { FlowDiagram } from "@/components/dashboard/flowdiagram"
 
 const STATUS = {
   live: { tone: "bg-primary", label: "live" },
@@ -172,6 +173,7 @@ export function App() {
 
           {tab === "flow" && (
             <div className="space-y-4">
+              <FlowDiagram frame={frame} status={status} />
               <Pipeline frame={frame} />
               <div className="grid items-start gap-4 xl:grid-cols-2">
                 <EnginePanel frame={frame} />
