@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod audit;
+mod auth;
 mod bench;
 mod capacity;
 mod consistency;
@@ -151,6 +152,7 @@ impl Leases {
 
 struct App {
     engine: Mutex<Engine>,
+    auth: Mutex<auth::Auth>,
     capacity: Mutex<CapacityController>,
     leases: Mutex<Leases>,
     sim: Mutex<Option<Sim>>,
@@ -205,8 +207,19 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let (tx, _) = broadcast::channel(64);
+    let auth_state = auth::Auth::from_env()?;
+    if auth_state.is_enforced() {
+        tracing::info!("auth enforced: application keys on the data path, console logins for everything else");
+    } else {
+        tracing::warn!(
+            "auth is OPEN: every route answers without a credential. Set AURA_AUTH=enforced \
+             for anything with a public address"
+        );
+    }
+
     let app = Arc::new(App {
         engine: Mutex::new(engine),
+        auth: Mutex::new(auth_state),
         capacity: Mutex::new(CapacityController::new(&cfg)),
         leases: Mutex::new(Leases::default()),
         sim: Mutex::new(sim),
@@ -224,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
     // the bundles land.
     if app.supabase.is_some() {
         tokio::spawn(pull_models(app.clone()));
+        tokio::spawn(load_keys(app.clone()));
     }
     if args.real_backend {
         if app.supabase.is_some() {
@@ -302,6 +316,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/nodes", get(nodes))
         .route("/v1/model/reload", post(model_reload))
         .route("/v1/supabase", get(supabase_status))
+        .route("/v1/keys", get(keys_list).post(keys_mint))
+        .route("/v1/keys/:id", delete(keys_revoke))
         .route("/v1/scenarios", get(scenarios))
         .route("/v1/sim/start", post(sim_start))
         .route("/v1/sim/stop", post(sim_stop))
@@ -315,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
             axum::http::header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ))
+        .layer(axum::middleware::from_fn_with_state(app.clone(), gate))
         .layer(cors)
         .with_state(app);
 
@@ -552,6 +569,9 @@ fn build_frame(app: &Shared) -> Value {
                 "origin_calls_suppressed": lease_suppressed
             }
         },
+        "auth": {
+            "enforced": app.auth.lock().is_enforced()
+        },
         "fidelity": {
             // Where the requests came from, not what we wish they came from. The generator
             // only runs when a scenario was started; with it stopped, every request on this
@@ -584,6 +604,164 @@ fn cost_profile(app: &str) -> &'static str {
         "content" => "gpu_heavy",
         "recommendation" => "mixed",
         _ => "unknown",
+    }
+}
+
+
+/// One gate in front of every route.
+///
+/// Written as a layer rather than per handler so that a route added later cannot be added
+/// without an answer to "who may call this": `need_for` classifies by path and method, and
+/// anything it does not recognise falls into the strictest class.
+async fn gate(
+    State(app): State<Shared>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let need = auth::need_for(&method, &path);
+
+    // The socket handshake cannot carry a header from a browser, so the console passes its
+    // token in the query string there. Everything else uses Authorization.
+    let bearer = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .or_else(|| {
+            req.uri().query().and_then(|q| {
+                q.split('&').find_map(|kv| kv.strip_prefix("token=").map(str::to_string))
+            })
+        });
+
+    let verdict = app.auth.lock().authorise(need, bearer.as_deref());
+    match verdict {
+        Ok(caller) => {
+            req.extensions_mut().insert(caller);
+            next.run(req).await
+        }
+        Err(denial) => (
+            StatusCode::from_u16(denial.status()).unwrap_or(StatusCode::UNAUTHORIZED),
+            Json(json!({ "error": denial.message(), "path": path })),
+        )
+            .into_response(),
+    }
+}
+
+/// Adopt the keys issued in earlier runs. Failure here is loud but not fatal: the engine
+/// still serves, and newly minted keys still work; it is the old ones that stop.
+async fn load_keys(app: Shared) {
+    let Some(sb) = app.supabase.as_ref() else { return };
+    match sb.api_keys().await {
+        Ok(rows) => {
+            let keys: Vec<auth::ApiKey> = rows.iter().filter_map(auth::ApiKey::from_row).collect();
+            let n = keys.len();
+            app.auth.lock().adopt(keys);
+            if n > 0 {
+                tracing::info!("adopted {n} application keys from the control plane");
+            }
+        }
+        Err(e) => tracing::warn!(
+            "could not read application keys ({e}); keys issued before this restart will \
+             not be recognised. Apply training/sql/007_api_keys.sql if the table is missing"
+        ),
+    }
+}
+
+/// Keys this engine issued. Hashes and hints only: the secret existed once, at mint time.
+async fn keys_list(State(app): State<Shared>) -> Json<Value> {
+    let a = app.auth.lock();
+    Json(json!({ "enforced": a.is_enforced(), "keys": a.keys() }))
+}
+
+#[derive(Deserialize)]
+struct MintBody {
+    application: String,
+}
+
+/// Mint a key for an application. The secret comes back exactly once; there is nowhere to
+/// read it from afterwards, which is the point.
+async fn keys_mint(
+    State(app): State<Shared>,
+    Json(body): Json<MintBody>,
+) -> impl IntoResponse {
+    let name = body.application.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "an application name is required; the key is that application's identity" })),
+        )
+            .into_response();
+    }
+    let (secret, key) = {
+        let mut rng = || {
+            let mut b = [0u8; 8];
+            getrandom_bytes(&mut b);
+            u64::from_le_bytes(b)
+        };
+        app.auth.lock().mint(&name, &mut rng)
+    };
+    let now = { app.engine.lock().now_ms };
+    app.engine.lock().audit.record(
+        now,
+        audit::AuditKind::ModelLoad,
+        audit::Severity::Notice,
+        &key.id,
+        &name,
+        format!("Issued an application key to {name}. Every request carrying it is attributed to that application."),
+        vec![audit::Fact::new("key", key.hint.clone())],
+        0.0,
+    );
+    if let Some(sb) = app.supabase.as_ref() {
+        // Persisted before it is returned. A key the caller holds but the control plane
+        // never saw would stop working at the next restart, silently.
+        if let Err(e) = sb.insert_api_key(&key.as_row()).await {
+            tracing::warn!("key {} was not persisted ({e}); it will not survive a restart", key.id);
+        }
+    }
+    (StatusCode::CREATED, Json(json!({ "secret": secret, "key": key }))).into_response()
+}
+
+async fn keys_revoke(State(app): State<Shared>, Path(id): Path<String>) -> impl IntoResponse {
+    let found = app.auth.lock().revoke(&id);
+    if found {
+        if let Some(sb) = app.supabase.as_ref() {
+            if let Err(e) = sb.revoke_api_key(&id).await {
+                tracing::warn!("key {id} revoked here but not in the control plane ({e}); it \
+                                will come back at the next restart");
+            }
+        }
+    }
+    if found {
+        (StatusCode::OK, Json(json!({ "revoked": id })))
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such key" })))
+    }
+}
+
+/// Randomness for key material. `getrandom` through the OS rather than the engine's seeded
+/// RNG: that one is deliberately reproducible, which is exactly wrong for a secret.
+fn getrandom_bytes(buf: &mut [u8]) {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(buf).is_ok() {
+            return;
+        }
+    }
+    // Windows and anything else without /dev/urandom: mix several clock readings, which is
+    // weaker than a CSPRNG and is why this path also logs.
+    tracing::warn!("no OS entropy source; key material is derived from the clock");
+    let mut acc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    for b in buf.iter_mut() {
+        acc ^= acc << 13;
+        acc ^= acc >> 7;
+        acc ^= acc << 17;
+        *b = (acc & 0xff) as u8;
     }
 }
 
@@ -686,6 +864,7 @@ struct PutBody {
 async fn cache_put(
     State(app): State<Shared>,
     Path(key): Path<String>,
+    caller: Option<axum::Extension<auth::Caller>>,
     Json(body): Json<PutBody>,
 ) -> Json<Value> {
     let id = key_id(&key);
@@ -693,6 +872,15 @@ async fn cache_put(
     // The rebuild is done; whoever was waiting on the lease may proceed.
     app.leases.lock().release(id);
     let mut eng = app.engine.lock();
+    let mut body = body;
+    // A key is issued to one application, so the credential names the application and the
+    // body cannot. Otherwise one service could file its objects, its costs and its profile
+    // under another service's name, by typing a different string.
+    if let Some(axum::Extension(c)) = caller.as_ref() {
+        if let Some(name) = c.application() {
+            body.context.application = name.to_string();
+        }
+    }
     let measured = body.measured.unwrap_or(body.context.regen);
     let version = body
         .context
@@ -1178,6 +1366,7 @@ async fn profile_get(State(app): State<Shared>, Path(name): Path<String>) -> Jso
 async fn profile_put(
     State(app): State<Shared>,
     Path(name): Path<String>,
+    caller: Option<axum::Extension<auth::Caller>>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let mut eng = app.engine.lock();
@@ -1206,6 +1395,13 @@ async fn profile_put(
             crate::audit::Fact::new("objective", profile.objective.as_str()),
             crate::audit::Fact::new("admission_margin", format!("{:.2}x", profile.admission_margin)),
             crate::audit::Fact::new("sla_weight", format!("{:.1}x", profile.sla_weight)),
+            crate::audit::Fact::new(
+                "changed_by",
+                caller
+                    .as_ref()
+                    .map(|axum::Extension(c)| c.label())
+                    .unwrap_or_else(|| "anonymous".to_string()),
+            ),
         ],
         0.0,
     );

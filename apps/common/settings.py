@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     aura_connect_timeout_s: float = 0.5
     aura_max_connections: int = 64
 
+    # The key this service presents to the cache. Empty against an engine running open,
+    # required against one running enforced. Accepted unprefixed as well, because that is
+    # the name a deployment platform's secret manager will use.
+    aura_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AURA_APPS_AURA_API_KEY", "AURA_API_KEY"),
+    )
+
     # Circuit breaker guarding every call to aura-server.
     breaker_failure_threshold: int = 5
     breaker_reset_s: float = 10.0

@@ -19,6 +19,8 @@ import {
 } from "@/components/dashboard/panels"
 import { ActivityLog } from "@/components/dashboard/activity"
 import { ProfilesPanel } from "@/components/dashboard/profiles"
+import { OnboardingPanel } from "@/components/dashboard/onboarding"
+import { AuthNotice, SessionChip, useSession } from "@/components/dashboard/signin"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
 import { FlowDiagram } from "@/components/dashboard/flowdiagram"
 
@@ -36,12 +38,14 @@ const TABS = [
   { id: "flow", label: "Request flow" },
   { id: "decisions", label: "Decisions" },
   { id: "tuning", label: "Tuning" },
+  { id: "connect", label: "Connect" },
   { id: "benchmark", label: "Benchmark" },
   { id: "system", label: "Model & system" },
 ]
 
 export function App() {
   const { frame, history, status, send, log } = useLiveFeed()
+  const { session } = useSession()
   const [tab, setTab] = useState("live")
   const rootRef = useRef(null)
 
@@ -105,6 +109,7 @@ export function App() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2.5">
+              <SessionChip session={session} />
               <MiniStat
                 label="Simulated time"
                 value={`${Number(frame?.virtual_time_s ?? 0).toFixed(0)}s`}
@@ -126,6 +131,8 @@ export function App() {
         <div data-hero className="mb-5">
           <TrafficSource frame={frame} status={status} />
         </div>
+
+        <AuthNotice enforced={Boolean(frame?.auth?.enforced)} session={session} />
 
         {status === "offline" && (
           <div className="mb-5 rounded-2xl border border-rose-500/30 bg-rose-500/5 p-5">
@@ -226,6 +233,8 @@ export function App() {
               <ApplicationsPanel frame={frame} />
             </div>
           )}
+
+          {tab === "connect" && <OnboardingPanel frame={frame} />}
 
           {tab === "benchmark" && (
             <div className="space-y-4">

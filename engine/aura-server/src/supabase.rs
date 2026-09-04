@@ -23,6 +23,7 @@ const RUNS_TABLE: &str = "aura_benchmark_runs";
 const RESULTS_TABLE: &str = "aura_benchmark_results";
 const EVENTS_TABLE: &str = "aura_events";
 const AUDIT_TABLE: &str = "aura_audit_log";
+const KEYS_TABLE: &str = "aura_api_keys";
 const MODEL_BUCKET: &str = "aura-models";
 
 #[derive(Debug, Clone)]
@@ -227,6 +228,49 @@ impl Supabase {
             );
         }
         Ok(entries.len())
+    }
+
+    /// Application keys, as hashes. Read once at boot so a restart does not invalidate every
+    /// key an operator handed out, which on a platform that restarts containers freely would
+    /// make keys useless.
+    pub async fn api_keys(&self) -> anyhow::Result<Vec<Value>> {
+        let url = format!("{}?select=*&order=created_at.asc", self.rest(KEYS_TABLE));
+        let res = self.req(self.client.get(&url)).send().await?;
+        if !res.status().is_success() {
+            anyhow::bail!("key fetch failed: {}", res.status());
+        }
+        Ok(res.json::<Vec<Value>>().await?)
+    }
+
+    /// Record a minted key. The secret is not sent: only its hash, which is all the engine
+    /// itself keeps, so a copy of this table is not a set of working credentials.
+    pub async fn insert_api_key(&self, row: &Value) -> anyhow::Result<()> {
+        let res = self
+            .req(self.client.post(self.rest(KEYS_TABLE)))
+            .json(&json!([row]))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "key insert failed: {} {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn revoke_api_key(&self, id: &str) -> anyhow::Result<()> {
+        let url = format!("{}?id=eq.{id}", self.rest(KEYS_TABLE));
+        let res = self
+            .req(self.client.patch(&url))
+            .json(&json!({ "revoked": true }))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!("key revoke failed: {}", res.status());
+        }
+        Ok(())
     }
 
     pub async fn push_event(&self, kind: &str, detail: Value) -> anyhow::Result<()> {

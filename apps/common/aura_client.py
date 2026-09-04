@@ -88,6 +88,22 @@ class RegenOutcome:
     serve_ms: float
 
 
+def _headers(application: str, api_key: str | None) -> dict[str, str]:
+    """Headers every call carries.
+
+    The key is the application's identity as far as the engine is concerned: it attributes
+    requests to the application the key was issued to and ignores any name in the body. An
+    engine running open accepts calls without one, which is what keeps the local demo a
+    single command.
+    """
+    settings = get_settings()
+    key = api_key if api_key is not None else settings.aura_api_key
+    headers = {"user-agent": f"aura-app/{application}"}
+    if key:
+        headers["authorization"] = f"Bearer {key}"
+    return headers
+
+
 class CircuitBreaker:
     """Trips after N consecutive failures, half-opens after a cooldown.
 
@@ -147,6 +163,7 @@ class AuraClient:
         pricing: Pricing | None = None,
         failure_threshold: int | None = None,
         breaker_reset_s: float | None = None,
+        api_key: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         settings = get_settings()
@@ -168,7 +185,7 @@ class AuraClient:
             timeout=timeout,
             limits=limits,
             transport=transport,
-            headers={"user-agent": f"aura-app/{application}"},
+            headers=_headers(application, api_key),
         )
         self._breaker = CircuitBreaker(
             failure_threshold if failure_threshold is not None else settings.breaker_failure_threshold,

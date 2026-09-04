@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 
-import { get } from "@/hooks/useLiveFeed"
+import { del, get, put } from "@/hooks/useLiveFeed"
 import { bytes, cn, pct } from "@/lib/utils"
 import { Panel, Pill } from "./primitives"
 
@@ -15,22 +15,12 @@ import { Panel, Pill } from "./primitives"
 ///   whatever comes back from the write rather than what it optimistically sent, so a knob
 ///   never shows a number the cache is not actually using.
 
-const BASE = import.meta.env.VITE_AURA_URL || "http://localhost:8080"
-
 async function putProfile(application, body) {
-  const res = await fetch(
-    `${BASE}/v1/applications/${encodeURIComponent(application)}/profile`,
-    { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
-  )
-  return res.json()
+  return put(`/v1/applications/${encodeURIComponent(application)}/profile`, body)
 }
 
 async function resetProfile(application) {
-  const res = await fetch(
-    `${BASE}/v1/applications/${encodeURIComponent(application)}/profile`,
-    { method: "DELETE" }
-  )
-  return res.json()
+  return del(`/v1/applications/${encodeURIComponent(application)}/profile`)
 }
 
 export function ProfilesPanel({ frame }) {

@@ -195,12 +195,41 @@ running on the online logistic fallback, and you should not claim a trained mode
 
 ---
 
-## 7. Known gaps at deploy time
+## 7. Authentication
 
-- **No authentication on any route.** A public engine URL means anyone can `PUT` into the
-  cache, `DELETE` keys, or drive `/v1/sim/*`. For a public demo either keep the engine
-  private and expose only the dashboard, or put a shared token in front of the write
-  routes. Not fixed yet.
+Two callers, two credentials.
+
+**Applications** carry a key: `Authorization: Bearer aura_sk_...`, minted on the console's
+Connect tab and shown exactly once. The engine stores a SHA-256 hash and so does
+`aura_api_keys`, so neither a memory dump nor a copy of the table is a working credential.
+The key is also the application's identity: the engine attributes every request under it to
+the application it was issued to and ignores any name in the request body, which is what
+makes onboarding "mint a key, point the service at the URL, watch it appear".
+
+**People** sign in through Supabase Auth in the browser. The engine verifies the token with
+`SUPABASE_JWT_KEY` (Project Settings → API → JWT Settings), HS256 only, and keeps no user
+table. An application key deliberately cannot change how the cache behaves: profiles,
+simulation and capacity need a console login, so a leaked key cannot re-tune the cache for
+everyone else.
+
+Mode is explicit, never inferred:
+
+```
+AURA_AUTH=open       # every route answers. Local demos.
+AURA_AUTH=enforced   # required for anything with a public address.
+```
+
+Enforced without `SUPABASE_JWT_KEY` is a refusal to start, not a warning, because a
+deployment that silently downgrades to open is one nobody notices until it matters.
+
+Apply `training/sql/007_api_keys.sql` before enforcing, or keys will not survive a restart
+— which on a platform that recycles containers means they stop working within the hour.
+
+Set on the engine service: `AURA_AUTH=enforced`, `SUPABASE_JWT_KEY`, `SUPABASE_URL`,
+`SUPABASE_SERVICE_ROLE_SECRET_KEY`. On each application service: `AURA_API_KEY`. On the
+dashboard build: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_AURA_URL`.
+
+## 8. Known gaps at deploy time
 - **Model bundles are not in the image.** `engine/models/` is gitignored, so a fresh
   container starts empty and pulls from Supabase on boot. That is the intended path, but it
   makes Supabase a boot dependency for the trained model.

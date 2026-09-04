@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
+import { authHeaders, token } from "@/lib/session"
+
 const API = import.meta.env.VITE_AURA_URL || "http://localhost:8080"
 const WS = API.replace(/^http/, "ws")
 const HISTORY_LIMIT = 240
@@ -71,7 +73,7 @@ export function useLiveFeed() {
     if (pollRef.current) return
     pollRef.current = setInterval(async () => {
       try {
-        const res = await fetch(`${API}/v1/stats`)
+        const res = await fetch(`${API}/v1/stats`, { headers: authHeaders() })
         if (!res.ok) throw new Error(String(res.status))
         record(await res.json())
         setStatus("polling")
@@ -88,7 +90,10 @@ export function useLiveFeed() {
       if (closed) return
       let socket
       try {
-        socket = new WebSocket(`${WS}/v1/live`)
+        // A browser cannot set a header on a socket handshake, so the token goes in the
+        // query string. It is the same token, over the same TLS connection.
+        const t = token()
+        socket = new WebSocket(`${WS}/v1/live${t ? `?token=${encodeURIComponent(t)}` : ""}`)
       } catch {
         startPolling()
         return
@@ -140,13 +145,27 @@ export function useLiveFeed() {
 export async function post(path, body) {
   const res = await fetch(`${API}${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...authHeaders() },
     body: JSON.stringify(body ?? {}),
   })
   return res.json()
 }
 
 export async function get(path) {
-  const res = await fetch(`${API}${path}`)
+  const res = await fetch(`${API}${path}`, { headers: authHeaders() })
+  return res.json()
+}
+
+export async function del(path) {
+  const res = await fetch(`${API}${path}`, { method: "DELETE", headers: authHeaders() })
+  return res.json()
+}
+
+export async function put(path, body) {
+  const res = await fetch(`${API}${path}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body ?? {}),
+  })
   return res.json()
 }
