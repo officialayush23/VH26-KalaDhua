@@ -2,7 +2,9 @@
 
 mod bench;
 mod capacity;
+mod consistency;
 mod engine;
+mod feedback;
 mod policy;
 mod predictor;
 mod store;

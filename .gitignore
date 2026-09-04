@@ -73,3 +73,21 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# session transfer leftovers
+_incoming_src.tgz
+_to_delete/
+_fe.tgz
+_transfer.tgz
+
+# trained model bundles are pulled from Supabase, not committed
+engine/models/
+
+# local editor lock files
+*.lock.tmp
+
+# python virtual environments created inside the repo
+aura/
+.venv/
+venv/
+env/
