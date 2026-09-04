@@ -134,6 +134,6 @@ In rough priority order.
 
 ## Conventions being followed
 
-No AI-authored markers anywhere: no generated-by comments, no Co-Authored-By trailers, no
-tool attribution in commits. Commits are local only; nothing has been pushed. `.env` is
+No generated-by markers anywhere: no tool comments, no Co-Authored-By trailers, no
+attribution of any kind in commits or metadata. Commits are local only; nothing has been pushed. `.env` is
 never committed.
