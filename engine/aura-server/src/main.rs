@@ -490,6 +490,8 @@ fn build_frame(app: &Shared) -> Value {
             "override": eng.override_policy.map(|p| p.as_str())
         },
         "engine": {
+            "requests": eng.requests,
+            "stale_serves": eng.stale_serves,
             "admissions": eng.store.admissions,
             "admissions_rejected": eng.rejections,
             "evictions": eng.store.evictions,
@@ -974,6 +976,11 @@ async fn policy_get(State(app): State<Shared>) -> Json<Value> {
         "mixture": eng.bandit.mixture_map(),
         "bandit": app.cfg.bandit.kind,
         "ml_influence": round4(eng.predictor.confidence()),
+        "predictor": eng.predictor.kind().as_str(),
+        "predictor_source": eng.predictor.source.as_str(),
+        "features": eng.predictor.feature_count(),
+        "holdout_auc": eng.predictor.holdout_auc(),
+        "regime": eng.regime.as_str(),
         "override": eng.override_policy.map(|p| p.as_str())
     }))
 }

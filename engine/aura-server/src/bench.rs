@@ -67,7 +67,13 @@ pub fn run(
     let mut rows = Vec::new();
     for name in policies {
         let row = match name.as_str() {
-            "aura" => Some(run_aura(cfg, &stream, capacity_bytes, seed)),
+            "aura" => Some(run_aura(cfg, &stream, capacity_bytes, seed, true)),
+            // The same engine with the capacity controller switched off, so the two claims
+            // can be told apart. If `aura` wins and `aura_fixed` does not, the win came
+            // from sizing the pool rather than from ranking objects better -- which is a
+            // real result, but a different one, and quoting the first while meaning the
+            // second is how benchmarks lie.
+            "aura_fixed" => Some(run_aura(cfg, &stream, capacity_bytes, seed, false)),
             other => run_baseline(cfg, &stream, capacity_bytes, other),
         };
         if let Some(row) = row {
@@ -93,7 +99,7 @@ pub fn run(
         .map(|r| r.total_cost_usd)
         .unwrap_or(0.0);
     let mut improvement = serde_json::Map::new();
-    for r in rows.iter().filter(|r| r.policy != "aura") {
+    for r in rows.iter().filter(|r| r.policy != "aura" && r.policy != "aura_fixed") {
         let gain = if r.total_cost_usd > 0.0 {
             (r.total_cost_usd - aura_cost) / r.total_cost_usd
         } else {
@@ -116,14 +122,20 @@ pub fn run(
     }
 }
 
-fn run_aura(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, seed: u64) -> BenchRow {
+fn run_aura(
+    cfg: &Config,
+    stream: &[aura_sim::Request],
+    capacity: u64,
+    seed: u64,
+    adaptive_capacity: bool,
+) -> BenchRow {
     let mut c = cfg.clone();
     c.cache.capacity_bytes = capacity;
     // Adaptive capacity is one of the engine's two differentiators and switching it off
-    // here was measuring the other one alone. It stays on, and every byte it decides to
-    // rent is charged at the same price the baselines pay, integrated over time. The
-    // baselines keep a fixed pool because having no way to resize is exactly the gap.
-    c.capacity.auto = true;
+    // here was measuring the other one alone. When it is on, every byte it decides to rent
+    // is charged at the same price the baselines pay, integrated over time. The baselines
+    // keep a fixed pool because having no way to resize is exactly the gap.
+    c.capacity.auto = adaptive_capacity;
     c.capacity.min_bytes = capacity / 4;
     c.capacity.max_bytes = capacity * 4;
     let mut controller = CapacityController::new(&c);
@@ -173,7 +185,7 @@ fn run_aura(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, seed: u64
     let holding = cfg.pricing.holding_cost_usd(mean_resident as f64, span_ms);
 
     BenchRow {
-        policy: "aura".into(),
+        policy: if adaptive_capacity { "aura".into() } else { "aura_fixed".into() },
         capacity_start_bytes: capacity,
         capacity_end_bytes: capacity_end,
         mean_resident_bytes: mean_resident,

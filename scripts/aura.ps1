@@ -211,7 +211,7 @@ function Invoke-AuraBench {
         [string]$Scenario = 'expensive_tail',
         [int]$Requests = 80000,
         [long]$CapacityBytes = 134217728,
-        [string[]]$Policies = @('lru','fifo','lfu','gds','gdsf','tinylfu','s3fifo','sieve','lecar','aura')
+        [string[]]$Policies = @('lru','fifo','lfu','gds','gdsf','tinylfu','s3fifo','sieve','lecar','aura','aura_fixed')
     )
     Write-Host "running $($Policies.Count) policies over $Requests requests on '$Scenario'..." -ForegroundColor Cyan
     $report = Invoke-Aura -Path '/v1/bench/run' -Method Post -Body @{
@@ -226,9 +226,13 @@ function Invoke-AuraBench {
                      @{L='hit rate';E={'{0:P1}' -f $_.object_hit_rate}},
                      @{L='byte hit';E={'{0:P1}' -f $_.byte_hit_rate}},
                      @{L='cost USD';E={'{0:N4}' -f $_.total_cost_usd}},
+                     @{L='regen USD';E={'{0:N4}' -f $_.regen_cost_usd}},
+                     @{L='hold USD';E={'{0:N4}' -f $_.holding_cost_usd}},
                      @{L='backend';E={$_.backend_requests}},
+                     @{L='pool MB';E={'{0:N0}' -f ($_.capacity_end_bytes / 1MB)}},
                      @{L='mean MB';E={'{0:N0}' -f ($_.mean_resident_bytes / 1MB)}},
-                     @{L='meta KB';E={'{0:N0}' -f ($_.memory_overhead_bytes / 1KB)}} -AutoSize
+                     @{L='meta KB';E={'{0:N0}' -f ($_.memory_overhead_bytes / 1KB)}} -AutoSize |
+        Out-Host
 
     if ($report.belady_upper_bound) {
         Write-Host ("Belady ceiling: {0:P1} hit rate at `${1:N4}" -f `
@@ -251,19 +255,23 @@ function Invoke-AuraBenchSuite {
     #>
     param([int]$Requests = 80000, [long]$CapacityBytes = 134217728)
     $summary = @()
-    foreach ($s in @('expensive_tail','mixed_production','flash_crowd','cost_spike','scan')) {
+    foreach ($s in @('expensive_tail','mixed_production','flash_crowd','scan_resistance','shifting_popularity','steady_zipf')) {
         Write-Host "`n===== $s =====" -ForegroundColor Magenta
         $r = Invoke-AuraBench -Scenario $s -Requests $Requests -CapacityBytes $CapacityBytes
         if ($null -eq $r) { continue }
-        $aura = $r.rows | Where-Object { $_.policy -eq 'aura' }
-        $best = $r.rows | Where-Object { $_.policy -ne 'aura' } | Sort-Object total_cost_usd | Select-Object -First 1
+        $aura  = $r.rows | Where-Object { $_.policy -eq 'aura' }
+        $fixed = $r.rows | Where-Object { $_.policy -eq 'aura_fixed' }
+        $best  = $r.rows | Where-Object { $_.policy -notlike 'aura*' } | Sort-Object total_cost_usd | Select-Object -First 1
         $summary += [pscustomobject]@{
             scenario      = $s
             winner        = $r.winner
             aura_usd      = $aura.total_cost_usd
+            fixed_usd     = if ($fixed) { $fixed.total_cost_usd } else { $null }
             best_rival    = $best.policy
             rival_usd     = $best.total_cost_usd
             margin        = if ($best.total_cost_usd -gt 0) { ($best.total_cost_usd - $aura.total_cost_usd) / $best.total_cost_usd } else { 0 }
+            # Separating the two claims: does the ranking win, or only the sizing?
+            rank_margin   = if ($fixed -and $best.total_cost_usd -gt 0) { ($best.total_cost_usd - $fixed.total_cost_usd) / $best.total_cost_usd } else { $null }
         }
     }
     Write-Host "`n===== summary =====" -ForegroundColor Magenta
@@ -272,10 +280,14 @@ function Invoke-AuraBenchSuite {
                             @{L='aura USD';E={'{0:N4}' -f $_.aura_usd}},
                             @{L='best rival';E={$_.best_rival}},
                             @{L='rival USD';E={'{0:N4}' -f $_.rival_usd}},
-                            @{L='margin';E={'{0:P2}' -f $_.margin}} -AutoSize
-    $won = ($summary | Where-Object { $_.winner -eq 'aura' }).Count
+                            @{L='margin';E={'{0:P2}' -f $_.margin}},
+                            @{L='rank only';E={ if ($null -ne $_.rank_margin) { '{0:P2}' -f $_.rank_margin } else { 'n/a' } }} -AutoSize |
+        Out-Host
+    $won = ($summary | Where-Object { $_.winner -like 'aura*' }).Count
     $colour = if ($won -ge 3) { 'Green' } else { 'Red' }
     Write-Host "aura wins $won of $($summary.Count) scenarios (the brief asks for 3)" -ForegroundColor $colour
+    Write-Host "'margin' is aura with adaptive capacity; 'rank only' is the same engine with a fixed pool," -ForegroundColor DarkGray
+    Write-Host "so the gap between them is what the capacity controller is worth on its own." -ForegroundColor DarkGray
     return $summary
 }
 
