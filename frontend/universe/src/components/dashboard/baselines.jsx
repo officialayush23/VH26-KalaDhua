@@ -15,7 +15,6 @@ const BLURB = {
   lru: "Evicts whatever was touched least recently. Knows nothing about size or cost.",
   lfu: "Evicts the least frequently used. Popular beats expensive, always.",
   gds: "Greedy-Dual Size: cost per byte, with an inflation term so old objects age out.",
-  gdsf: "Greedy-Dual Size Frequency: the same, plus how often it was asked for. The strongest classical baseline.",
   tinylfu: "W-TinyLFU: a frequency sketch guarding a small admission window.",
   s3fifo: "Three FIFO queues, one-hit objects filtered out early.",
   sieve: "A lazy promotion pointer over a single FIFO queue.",
@@ -58,7 +57,7 @@ export function BaselinesPanel({ frame }) {
       }
       footer={
         requests > 0
-          ? `Over ${requests.toLocaleString()} requests so far. A baseline with a higher hit rate and a higher bill kept more objects that were cheap to rebuild.`
+          ? `Over ${requests.toLocaleString()} requests. Object hit rate is not the objective and AURA will often trail on it: a policy that keeps a thousand small cheap objects hits more often than one keeping a hundred expensive ones, and pays more. Bytes served from cache, and the bill, are the numbers that answer the question.`
           : undefined
       }
     >
@@ -68,6 +67,7 @@ export function BaselinesPanel({ frame }) {
           label="AURA"
           total={auraTotal}
           hit={auraHit}
+          byteHit={frame?.layers?.l2?.byte_hit_rate}
           worst={worst}
           held={frame?.engine?.used_bytes}
           self
@@ -79,6 +79,7 @@ export function BaselinesPanel({ frame }) {
             label={name.toUpperCase()}
             total={v.total_usd ?? 0}
             hit={v.hit_rate ?? 0}
+            byteHit={v.byte_hit_rate}
             held={v.used_bytes}
             worst={worst}
             delta={savings[name] ?? 0}
@@ -89,7 +90,7 @@ export function BaselinesPanel({ frame }) {
   )
 }
 
-function Row({ name, label, total, hit, worst, held, delta, self }) {
+function Row({ name, label, total, hit, byteHit, worst, held, delta, self }) {
   const cheaper = (delta ?? 0) > 0
   return (
     <div
@@ -116,8 +117,14 @@ function Row({ name, label, total, hit, worst, held, delta, self }) {
         </div>
         <div className="flex items-baseline gap-4">
           <span className="text-[12.5px] text-muted-foreground">
-            hit <span className="font-mono tabular-nums text-foreground">{pct(hit, 1)}</span>
+            objects <span className="font-mono tabular-nums text-foreground">{pct(hit, 1)}</span>
           </span>
+          {byteHit != null && (
+            <span className="text-[12.5px] text-muted-foreground">
+              bytes{" "}
+              <span className="font-mono tabular-nums text-foreground">{pct(byteHit, 1)}</span>
+            </span>
+          )}
           {held != null && (
             <span className="text-[12.5px] text-muted-foreground">
               holding{" "}

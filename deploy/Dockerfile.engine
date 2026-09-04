@@ -9,6 +9,17 @@ FROM rust:1.83-slim-bookworm AS build
 
 WORKDIR /build
 
+# Build-time memory, not runtime memory. The release profile uses thin LTO with a single
+# codegen unit, which is right for the binary and wrong for a 512 MB build container: one
+# unit means one enormous compilation held in memory at once, and the build is killed rather
+# than failing with something readable. Turning LTO off and raising the unit count costs a
+# few percent of throughput in a service whose decision path is already 3 microseconds, and
+# it is the difference between a deploy that finishes and one that dies at 80%.
+ENV CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_NET_RETRY=5 \
+    CARGO_BUILD_JOBS=2
+
 # Dependencies are their own layer. Cargo re-resolves the whole graph whenever any manifest
 # changes, so copying manifests first and building a stub means a source edit rebuilds only
 # our crates — seconds instead of minutes.

@@ -511,6 +511,7 @@ fn build_frame(app: &Shared) -> Value {
             "penalty_usd": round4(s.penalty_usd),
             "holding_usd": round4(s.holding_usd),
             "hit_rate": round4(s.hit_rate()),
+            "byte_hit_rate": round4(s.byte_hit_rate()),
             // What the baseline is holding right now. Two policies at the same hit rate
             // are not equivalent if one of them is using half the pool to get there.
             "used_bytes": s.used_bytes()

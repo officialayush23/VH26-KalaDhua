@@ -133,6 +133,11 @@ pub struct Shadow {
     policy: Box<dyn CachePolicy>,
     pub hits: u64,
     pub misses: u64,
+    /// Bytes served from the baseline's own cache, and bytes it had to fetch. Object hit
+    /// rate alone cannot separate a policy that keeps a thousand small cheap objects from
+    /// one that keeps a hundred expensive ones, and that distinction is the whole argument.
+    pub hit_bytes: u64,
+    pub miss_bytes: u64,
     pub cost_usd: f64,
     pub penalty_usd: f64,
     pub holding_usd: f64,
@@ -158,6 +163,8 @@ impl Shadow {
             policy,
             hits: 0,
             misses: 0,
+            hit_bytes: 0,
+            miss_bytes: 0,
             cost_usd: 0.0,
             penalty_usd: 0.0,
             holding_usd: 0.0,
@@ -182,6 +189,15 @@ impl Shadow {
             0.0
         } else {
             self.hits as f64 / t as f64
+        }
+    }
+
+    pub fn byte_hit_rate(&self) -> f64 {
+        let t = self.hit_bytes + self.miss_bytes;
+        if t == 0 {
+            0.0
+        } else {
+            self.hit_bytes as f64 / t as f64
         }
     }
 
@@ -212,8 +228,10 @@ impl Shadow {
         let result = self.policy.access(&req);
         if result.hit {
             self.hits += 1;
+            self.hit_bytes += size;
         } else {
             self.misses += 1;
+            self.miss_bytes += size;
             self.cost_usd += cost_usd;
             self.penalty_usd += penalty_usd;
             self.holding_usd += holding_usd;
@@ -298,10 +316,11 @@ impl Engine {
         let predictor = Predictor::heuristic(cfg.predictor.online_lr);
         let bandit = Bandit::new(cfg.bandit.exploration, seed ^ 0x9E37);
         let consistency = Consistency::new(cfg.engine.soft_ttl_fraction);
-        // The three the brief names, plus GDSF, which is the one that actually competes:
-        // beating LRU in 2026 is not a result, and saying so before someone else does is
-        // better than being told.
-        let shadows = ["lru", "lfu", "gds", "gdsf"]
+        // The three the brief names, and only those. The full roster - GDSF, W-TinyLFU,
+        // S3-FIFO, SIEVE, LeCaR and the Belady bound - runs in the benchmark, where a
+        // controlled replay can say something meaningful about it. A live shadow is a
+        // different measurement and does not belong in the same sentence as those.
+        let shadows = ["lru", "lfu", "gds"]
             .into_iter()
             .filter_map(|name| Shadow::new(name, capacity))
             .collect();
@@ -608,7 +627,11 @@ impl Engine {
         self.eviction_threshold = victim_bar;
 
         let too_big = ctx.size_bytes > self.store.capacity_bytes() / 4;
+        // The regime detector flaps between Steady and Scan at low confidence on ordinary
+        // traffic, and refusing admissions on a 33%-confident guess costs hit rate for
+        // nothing. Below half confidence the classification is not evidence.
         let scan_suspect = self.regime == Regime::Scan
+            && self.regime_confidence >= 0.5
             && reuse[0] < 0.15
             && !self.store.touch_l1(key, now_ms);
 
