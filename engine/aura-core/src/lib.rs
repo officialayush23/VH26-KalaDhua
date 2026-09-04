@@ -21,6 +21,7 @@ pub mod features;
 pub mod list;
 pub mod policies;
 pub mod rng;
+pub mod signals;
 pub mod sketch;
 pub mod types;
 

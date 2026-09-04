@@ -14,11 +14,13 @@
 use crate::types::{CostVector, KeyId, SlaClass};
 
 pub mod classical;
+pub mod gds;
 pub mod learned;
 pub mod modern;
 pub mod oracle;
 
 pub use classical::{Fifo, Gdsf, Lfu, Lru};
+pub use gds::Gds;
 pub use learned::LeCaR;
 pub use modern::{S3Fifo, Sieve, WTinyLfu};
 pub use oracle::Belady;
@@ -172,6 +174,7 @@ pub fn build(name: &str, capacity_bytes: u64) -> Option<Box<dyn CachePolicy>> {
         "lru" => Some(Box::new(Lru::new(capacity_bytes))),
         "fifo" => Some(Box::new(Fifo::new(capacity_bytes))),
         "lfu" => Some(Box::new(Lfu::new(capacity_bytes))),
+        "gds" => Some(Box::new(Gds::new(capacity_bytes))),
         "gdsf" => Some(Box::new(Gdsf::new(capacity_bytes))),
         "tinylfu" | "w_tinylfu" => Some(Box::new(WTinyLfu::new(capacity_bytes))),
         "s3fifo" => Some(Box::new(S3Fifo::new(capacity_bytes))),
@@ -182,8 +185,10 @@ pub fn build(name: &str, capacity_bytes: u64) -> Option<Box<dyn CachePolicy>> {
 }
 
 /// Every policy that can be constructed without an oracle.
-pub const BASELINE_NAMES: [&str; 8] =
-    ["lru", "fifo", "lfu", "gdsf", "tinylfu", "s3fifo", "sieve", "lecar"];
+/// Every policy that can be constructed without an oracle. `gds` is listed because the
+/// brief names it explicitly; `gdsf` is its frequency-aware successor and usually wins.
+pub const BASELINE_NAMES: [&str; 9] =
+    ["lru", "fifo", "lfu", "gds", "gdsf", "tinylfu", "s3fifo", "sieve", "lecar"];
 
 #[cfg(test)]
 pub(crate) mod testkit {
