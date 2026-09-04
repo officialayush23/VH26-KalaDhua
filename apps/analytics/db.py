@@ -140,6 +140,10 @@ class PostgresBackend:
             }
         self._pool = await asyncpg.create_pool(
             dsn=self._dsn,
+            # Fail fast on a route that does not work. Without this the first attempt sits
+            # in a TCP connect until the OS gives up, which is far longer than anything
+            # waiting on /health is prepared to wait.
+            timeout=6.0,
             min_size=self._settings.db_pool_min_size,
             max_size=self._settings.db_pool_max_size,
             command_timeout=self._settings.db_statement_timeout_ms / 1000.0,
@@ -187,6 +191,9 @@ class SqliteBackend:
         )
 
     def _open(self) -> None:
+        parent = os.path.dirname(self._path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         fresh = not os.path.exists(self._path) or os.path.getsize(self._path) == 0
         connection = sqlite3.connect(self._path, check_same_thread=False)
         connection.row_factory = sqlite3.Row

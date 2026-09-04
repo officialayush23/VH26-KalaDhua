@@ -559,11 +559,16 @@ export function Controls({ frame, send, status }) {
   }
 
   const current = scenarios.find((s) => s.id === sim.scenario)
+  const liveApps = frame?.fidelity?.traffic === "applications"
 
   return (
     <Panel
       title="Drive the demo"
-      subtitle="Pick a traffic pattern, then throw a disturbance at it and watch the policy blend and pool size react."
+      subtitle={
+        liveApps
+          ? "These controls drive the engine's own traffic generator, which is currently off because real applications are the traffic. Starting it mixes synthetic requests into a live stream, so the cost numbers stop being attributable to either one."
+          : "Pick a traffic pattern, then throw a disturbance at it and watch the policy blend and pool size react. This is the engine's own generator: the requests are real requests through the real decision path, but the workload is synthetic."
+      }
       actions={
         <div className="flex items-center gap-2">
           <Pill tone={sim.running ? "good" : "warn"}>
@@ -574,6 +579,12 @@ export function Controls({ frame, send, status }) {
       }
       footer={current?.description}
     >
+      {liveApps && (
+        <p className="mb-4 rounded-lg border border-sky-400/40 bg-sky-400/10 px-3 py-2 text-[13px] text-sky-300">
+          Applications are the traffic source right now. Leave these alone unless you want the
+          generator's synthetic stream on top of it.
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex flex-col gap-1">
           <label className="text-[12px] uppercase tracking-wide text-muted-foreground">

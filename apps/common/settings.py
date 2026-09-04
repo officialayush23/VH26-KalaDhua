@@ -6,6 +6,8 @@ process environment, which is also how the compose deployment injects it.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from functools import lru_cache
 
 from pydantic import AliasChoices, BaseModel, Field
@@ -83,7 +85,12 @@ class Settings(BaseSettings):
     db_statement_timeout_ms: int = 15_000
     db_pool_min_size: int = 1
     db_pool_max_size: int = 8
-    sqlite_path: str = "/tmp/aura_analytics.sqlite3"
+    # The platform's own temporary directory, not a hardcoded /tmp: on Windows that path
+    # does not exist, so the fallback that exists to make the app always boot was the reason
+    # it never booted.
+    sqlite_path: str = Field(
+        default_factory=lambda: os.path.join(tempfile.gettempdir(), "aura_analytics.sqlite3")
+    )
     sqlite_orders: int = 300_000
 
     log_level: str = Field(

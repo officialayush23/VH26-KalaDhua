@@ -52,9 +52,15 @@ class AppTarget:
         return f"http://127.0.0.1:{self.port}"
 
 
+# The two workloads the argument rests on: one CPU-bound, one database-bound. Content is a
+# third cost shape (large objects, bandwidth-dominated, a priced third party) and is real,
+# but it is opt-in with --with-content so a demo run starts two services rather than three.
 TARGETS = [
     AppTarget("recommendation", 8101, "recommendation.main", "popularity_shift", 300, 0.20, concurrency=4),
     AppTarget("analytics", 8102, "analytics.main", "zipf", 240, 0.50, concurrency=16),
+]
+
+OPTIONAL_TARGETS = [
     AppTarget("content", 8103, "content.main", "burst", 1_500, 0.30, concurrency=8),
 ]
 
@@ -73,17 +79,38 @@ async def wait_healthy(client: httpx.AsyncClient, target: AppTarget, timeout_s: 
     return False
 
 
+def log_path(target: AppTarget) -> str:
+    """Where a spawned service's output goes."""
+    return os.path.join(REPO_APPS, "runs", f"{target.name}.log")
+
+
 def spawn(target: AppTarget) -> subprocess.Popen[bytes]:
-    """Start one service as a child process."""
+    """Start one service as a child process, keeping its output.
+
+    The output used to go to DEVNULL, which meant a service that died on its first line
+    reported nothing but "did not become healthy" - true, useless, and the reason a
+    five-minute problem took an evening.
+    """
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", REPO_APPS)
+    os.makedirs(os.path.join(REPO_APPS, "runs"), exist_ok=True)
+    handle = open(log_path(target), "wb")
     return subprocess.Popen(
         [sys.executable, "-m", target.module],
         cwd=REPO_APPS,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=handle,
+        stderr=subprocess.STDOUT,
     )
+
+
+def tail(path: str, lines: int = 20) -> str:
+    """The last few lines of a log file, for a failure message."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return "".join(fh.readlines()[-lines:]).rstrip()
+    except OSError:
+        return "(no output captured)"
 
 
 async def configure_tail(client: httpx.AsyncClient, target: AppTarget, enabled: bool) -> None:
@@ -188,7 +215,8 @@ def render(rows: list[tuple[AppTarget, dict[str, Any]]], elapsed: float) -> str:
 
 async def run(args: argparse.Namespace) -> int:
     """Drive the universe and print the live table."""
-    targets = [t for t in TARGETS if args.only is None or t.name in args.only]
+    available = TARGETS + (OPTIONAL_TARGETS if args.with_content else [])
+    targets = [t for t in available if args.only is None or t.name in args.only]
 
     if args.spawn:
         for target in targets:
@@ -199,6 +227,10 @@ async def run(args: argparse.Namespace) -> int:
         for target in targets:
             if not await wait_healthy(client, target, timeout_s=args.startup_timeout):
                 print(f"{target.name} did not become healthy at {target.base_url}", file=sys.stderr)
+                if args.spawn:
+                    print(f"--- last output from {target.name} " + "-" * 30, file=sys.stderr)
+                    print(tail(log_path(target)), file=sys.stderr)
+                    print("-" * 60, file=sys.stderr)
                 await shutdown(targets)
                 return 1
             await configure_tail(client, target, args.expensive_tail)
@@ -266,10 +298,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rps", type=float, default=20.0, help="aggregate requests per second across all apps")
     parser.add_argument("--duration", type=float, default=60.0, help="run time in seconds")
     parser.add_argument("--interval", type=float, default=5.0, help="seconds between table refreshes")
-    parser.add_argument("--spawn", action="store_true", help="start the three services as child processes")
+    parser.add_argument("--spawn", action="store_true", help="start the services as child processes")
     parser.add_argument("--expensive-tail", action="store_true", help="enable the expensive-tail workload")
     parser.add_argument("--price-spike", action="store_true", help="raise the content API price mid-run")
     parser.add_argument("--startup-timeout", type=float, default=120.0, help="seconds to wait for /health")
+    parser.add_argument(
+        "--with-content",
+        action="store_true",
+        help="also run the content service, the bandwidth-dominated third cost shape",
+    )
     parser.add_argument("--only", nargs="*", default=None, help="restrict to named applications")
     return parser.parse_args(argv)
 

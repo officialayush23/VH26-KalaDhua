@@ -169,6 +169,7 @@ export function App() {
         <div ref={paneRef}>
           {tab === "live" && (
             <div className="space-y-4">
+              <QuietEngine frame={frame} status={status} />
               <Headline frame={frame} history={history} />
               <div className="grid items-start gap-4 xl:grid-cols-3">
                 {/* The log is the page. Two thirds of the width and the full height of the
@@ -258,6 +259,34 @@ export function App() {
           light and dark.
         </footer>
       </div>
+    </div>
+  )
+}
+
+/// Zeroes are a truthful answer to "what has this cache done", and a confusing one if you
+/// do not know that nothing has asked it to do anything yet. This says which of the two
+/// situations you are in, and what to run.
+function QuietEngine({ frame, status }) {
+  if (status === "offline") return null
+  const requests = Number(frame?.engine?.requests ?? 0)
+  if (requests > 0) return null
+  const generatorOff = frame?.fidelity?.traffic === "applications"
+
+  return (
+    <div className="mb-1 rounded-2xl border border-border bg-card p-5">
+      <h2 className="text-[15px] font-semibold">
+        The engine is up and has served nothing yet
+      </h2>
+      <p className="mt-1.5 text-[13.5px] leading-relaxed text-muted-foreground">
+        {generatorOff
+          ? "No scenario is running, so the engine's own generator is off and every number below is genuinely zero until an application calls it. That is the mode you want for a real demo: the traffic comes from services that actually rebuild what they cache."
+          : "A scenario is configured but paused. Press start under Drive the demo, or point applications at the engine."}
+      </p>
+      {generatorOff && (
+        <pre className="mt-3 overflow-x-auto rounded-lg border border-border bg-background px-3.5 py-2.5 font-mono text-[12.5px] leading-relaxed">
+          cd apps{"\n"}python -m driver.run_universe --spawn --rps 20 --duration 60
+        </pre>
+      )}
     </div>
   )
 }
