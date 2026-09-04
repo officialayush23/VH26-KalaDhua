@@ -1,9 +1,4 @@
 //! Value types shared by the cache, the simulator and the HTTP surface.
-//!
-//! The cache never learns what an application *means*. It only sees the shape of an
-//! object: how big it is, how expensive it was to produce, how long it stays valid and
-//! how much its absence hurts. Everything in this module exists to keep that boundary
-//! honest.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,9 +6,7 @@ use serde::{Deserialize, Serialize};
 /// compares strings, and so traces stay compact.
 pub type KeyId = u64;
 
-/// Milliseconds on the engine clock. The live server feeds it wall time; the simulator
-/// feeds it virtual time. Nothing below this line can tell the difference, which is what
-/// lets one implementation serve both.
+/// Milliseconds on the engine clock.
 pub type Millis = f64;
 
 /// Service level expectation attached to an object by the application that produced it.
@@ -49,11 +42,6 @@ impl SlaClass {
 }
 
 /// What it costs to produce one object once, in physical units.
-///
-/// Deliberately *not* a single number. Two objects that both take 300 ms to regenerate can
-/// have completely different economics: one burns a GPU, the other holds a database
-/// connection open. Collapsing that into "latency" is exactly the information loss that
-/// makes conventional policies mis-rank objects.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct CostVector {
     #[serde(default)]
@@ -216,10 +204,6 @@ impl Layer {
 }
 
 /// Stable small integer for an application name.
-///
-/// The first three ids are pinned because the trained models carry them as a feature and
-/// the training pipeline pins the same values. Anything else hashes into a fixed range so
-/// a brand new application still gets a usable, deterministic id without retraining.
 pub fn app_id(name: &str) -> u16 {
     match name {
         "recommendation" => 0,

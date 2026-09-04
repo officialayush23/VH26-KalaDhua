@@ -76,9 +76,7 @@ impl CostLedger {
     }
 }
 
-/// A shadow cache that replays the same request stream under one classical policy. Running
-/// them alongside the live engine is what turns "we are cheaper" into a number measured on
-/// identical traffic rather than a separate run.
+/// A shadow cache that replays the same request stream under one classical policy.
 #[derive(Debug)]
 pub struct Shadow {
     pub policy: Policy,
@@ -281,9 +279,7 @@ impl Engine {
         self.enforce_capacity();
     }
 
-    /// The read path. No model runs here: a hit is a hash lookup, a counter touch and a
-    /// clone. Everything expensive happens on the miss path where a backend call is already
-    /// being paid for.
+    /// The read path.
     pub fn get(&mut self, key: KeyId, application: &str, now_ms: f64) -> Option<Entry> {
         self.now_ms = now_ms.max(self.now_ms);
         self.requests += 1;
@@ -615,9 +611,7 @@ impl Engine {
         combined * e.ttl_remaining_frac(now_ms).max(0.05)
     }
 
-    /// Density of the weakest resident object a sample can find. Zero while the cache has
-    /// room, because refusing an object costs a guaranteed backend call to avoid a
-    /// hypothetical one.
+    /// Density of the weakest resident object a sample can find.
     fn victim_bar(&mut self, incoming_bytes: u64, now_ms: f64) -> f64 {
         if self.store.fits(incoming_bytes) {
             return 0.0;

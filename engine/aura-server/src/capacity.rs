@@ -37,9 +37,7 @@ pub struct MrcPoint {
     pub hit_rate: f64,
 }
 
-/// Capacity control asks one question: does the next block of memory pay for itself?
-/// The miss-ratio curve gives the hit-rate gain, the cost model prices it, and the answer
-/// is a number in dollars per hour rather than a utilisation threshold.
+/// Capacity control asks one question: does the next block of memory pay for itself? The miss-ratio curve gives the hit-rate gain, the cost model prices it, and the answer is a number in dollars per hour rather than a utilisation threshold.
 #[derive(Debug)]
 pub struct CapacityController {
     pub manual: bool,
@@ -56,9 +54,7 @@ impl CapacityController {
         }
     }
 
-    /// Concave saturating fit anchored on the measured hit rate. It is an estimate and is
-    /// labelled as one, but it is anchored to live data at the current size rather than
-    /// invented wholesale.
+    /// Concave saturating fit anchored on the measured hit rate.
     pub fn mrc(&self, engine: &Engine) -> Vec<MrcPoint> {
         let cur = engine.store.capacity_bytes().max(1) as f64;
         let hr = engine.store.l2_stats.hit_rate().clamp(0.01, 0.99);

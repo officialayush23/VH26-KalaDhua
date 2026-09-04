@@ -4,9 +4,7 @@ use aura_core::types::{CostVector, KeyId, ObjectContext, SlaClass};
 use crate::attack::{ActiveAttack, Attack};
 use crate::scenario::{Scenario, ScenarioSpec};
 
-/// One synthetic request. The generator owns the *ground truth* about an object: how big
-/// it is and what rebuilding it actually costs. The cache is told the same thing an
-/// application would tell it, and nothing more.
+/// One synthetic request.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub ts_ms: f64,
@@ -264,9 +262,7 @@ impl Generator {
         }
     }
 
-    /// Each application has a different cost signature. That is the whole reason a single
-    /// global policy underperforms: the right trade-off for a 40 KB SQL aggregate is not
-    /// the right trade-off for a 2 MB media variant.
+    /// Each application has a different cost signature.
     fn cost_shape(&mut self, app_idx: usize, key_id: KeyId) -> (u64, CostVector) {
         let jitter = self.rng.range(0.8, 1.25);
         match app_idx {

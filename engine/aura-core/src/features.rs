@@ -1,17 +1,4 @@
 //! The feature builder.
-//!
-//! This is the twin of `training/aura_train/features.py`. The two implementations are
-//! asserted against a shared golden fixture (`training/tests/golden/feature_vectors.json`)
-//! by [`tests::golden_vectors_match_the_training_pipeline`], because a feature that means
-//! one thing at training time and another at serving time is worse than no feature at all.
-//!
-//! Two rules govern everything below:
-//!
-//! 1. **No leakage.** Every value emitted for the access at time `t` derives only from
-//!    accesses at or before `t`. Counters are decayed and *read*, then the current access
-//!    is folded in. Regeneration quantiles are read before the current observation is
-//!    folded in, because at decision time the engine has not yet paid for this miss.
-//! 2. **Streaming.** One pass, O(unique keys) memory, no lookahead.
 
 use crate::config::{FeatureConfig, Pricing};
 use crate::sketch::{DecayCounter, QuantilePair};
@@ -21,9 +8,7 @@ use ahash::AHashMap;
 /// Number of features in the vector the models consume.
 pub const N_FEATURES: usize = 16;
 
-/// Feature names, in contract order. Serialised into every model bundle and checked on
-/// load, so a bundle trained against a different vector is rejected rather than silently
-/// mis-scored.
+/// Feature names, in contract order.
 pub const FEATURE_NAMES: [&str; N_FEATURES] = [
     "log_age_ms",
     "log_inter_arrival_ms",
@@ -108,10 +93,6 @@ pub struct AmbientState {
 }
 
 /// Running regeneration-cost shape for one `(application, object_type)` group.
-///
-/// Grouping at this level is what keeps the cost model small: the engine does not fit a
-/// regression per key, it learns the shape of each operation class and lets the per-key
-/// features carry the rest.
 #[derive(Debug, Clone, Default)]
 pub struct CostGroup {
     pub latency: QuantilePair,
@@ -156,9 +137,7 @@ impl FeatureBuilder {
         self.groups.get(&(application.to_string(), object_type.to_string()))
     }
 
-    /// Drop per-key state for keys not seen since `cutoff_ms`. Called by the controller
-    /// tick; without it the builder's memory grows with the total key space rather than
-    /// the working set.
+    /// Drop per-key state for keys not seen since `cutoff_ms`.
     pub fn evict_stale(&mut self, cutoff_ms: f64) -> usize {
         let before = self.keys.len();
         self.keys.retain(|_, s| s.last_ts_ms >= cutoff_ms);
@@ -166,9 +145,6 @@ impl FeatureBuilder {
     }
 
     /// Build the feature vector for `event` and advance the builder's state.
-    ///
-    /// Not idempotent: every call advances the counters exactly once, which mirrors the
-    /// engine, where an access happens once.
     pub fn transform(&mut self, event: &AccessEvent, ambient: AmbientState) -> Features {
         debug_assert!(
             event.ts_ms >= self.last_ts_ms,
@@ -274,10 +250,6 @@ impl FeatureBuilder {
     }
 
     /// Rebuild a feature vector for a resident object *without* recording an access.
-    ///
-    /// Eviction scoring needs current features for objects nobody just asked for. Reading
-    /// the counters at `now_ms` without folding anything in is the difference between
-    /// scoring an object and pretending it was used.
     pub fn peek(
         &self,
         key: KeyId,
@@ -326,11 +298,6 @@ pub fn named(features: &Features) -> Vec<(&'static str, f64)> {
 }
 
 /// The LRU replica that reproduces `cache_pressure` and `ttl_remaining_frac` offline.
-///
-/// The training pipeline has no access to the engine's occupancy series, so it
-/// reconstructs a deterministic one from a plain LRU of the configured size. This type
-/// exists so the Rust side can reproduce the golden fixture exactly; the live engine reads
-/// its real occupancy instead.
 #[derive(Debug)]
 pub struct PressureReplica {
     capacity_bytes: u64,
@@ -409,9 +376,7 @@ mod tests {
             .join("../../training/tests/golden/feature_vectors.json")
     }
 
-    /// The contract between this file and the training pipeline. If this fails, one side
-    /// has drifted and every trained model in the registry is scoring against a different
-    /// feature space than it was fitted on.
+    /// The contract between this file and the training pipeline.
     #[test]
     fn golden_vectors_match_the_training_pipeline() {
         let path = golden_path();

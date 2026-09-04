@@ -1,7 +1,4 @@
 //! Engine configuration.
-//!
-//! Loaded from `engine/config/default.toml`, overridable per key by environment
-//! variables of the form `AURA__SECTION__KEY` (see [`Config::apply_env`]).
 
 use crate::types::CostVector;
 use serde::{Deserialize, Serialize};
@@ -9,11 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Bytes in a gigabyte, decimal — cloud providers bill in decimal gigabytes and so do we.
 pub const BYTES_PER_GB: f64 = 1_000_000_000.0;
 
-/// USD price table. Turns a physical cost vector into money.
-///
-/// These numbers are mirrored in `training/aura_train/config.py`. `regen_cost_usd` is a
-/// model feature, so a price table that drifts between the two silently shifts the feature
-/// distribution the model was trained on. There is a test that pins them.
+/// USD price table.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Pricing {
@@ -237,9 +230,7 @@ impl Default for BanditConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GhostConfig {
-    /// Fraction of keys sampled into the reuse-distance histogram. SHARDS-style spatial
-    /// sampling: a 1% sample tracks the miss-ratio curve within a couple of percent at a
-    /// hundredth of the memory.
+    /// Fraction of keys sampled into the reuse-distance histogram.
     pub sample_rate: f64,
     pub buckets: usize,
     /// Largest capacity, as a multiple of the current one, that the curve extrapolates to.
@@ -277,9 +268,6 @@ impl Config {
     }
 
     /// Overlay `AURA__SECTION__KEY` environment variables onto the loaded config.
-    ///
-    /// Only the knobs a deployment actually needs to move are wired up; everything else
-    /// stays in the file, where it is reviewable.
     pub fn apply_env(&mut self) {
         fn u64_var(name: &str) -> Option<u64> {
             std::env::var(name).ok()?.parse().ok()
@@ -323,9 +311,7 @@ impl Config {
         }
     }
 
-    /// Load `path` if it exists, fall back to defaults if it does not, then apply the
-    /// environment. A missing config file is not an error: the defaults are a working
-    /// configuration, which is what makes `docker run` with no volume work.
+    /// Load `path` if it exists, fall back to defaults if it does not, then apply the environment.
     pub fn load(path: Option<&std::path::Path>) -> Self {
         let mut cfg = match path {
             Some(p) if p.exists() => Self::from_path(p).unwrap_or_else(|err| {

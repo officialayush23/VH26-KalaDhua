@@ -270,9 +270,7 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x.clamp(-30.0, 30.0)).exp())
 }
 
-/// Logistic regression trained online from realised outcomes. It is what runs before any
-/// offline bundle exists, and it keeps running afterwards so the engine has a live signal
-/// to compare a stale bundle against.
+/// Logistic regression trained online from realised outcomes.
 #[derive(Debug)]
 pub struct OnlineLogistic {
     pub weights: [f64; N_FEATURES],

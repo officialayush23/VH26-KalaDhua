@@ -1,9 +1,4 @@
 //! Deterministic random number generation.
-//!
-//! Every experiment in this project has to be reproducible from a seed, so the engine
-//! never touches a thread-local or OS-seeded generator on a path that affects a decision.
-//! `xoshiro256**` is fast, has a long period and passes the usual statistical batteries —
-//! more than enough for sampling eviction candidates and generating workloads.
 
 #[derive(Debug, Clone)]
 pub struct Rng {
@@ -110,10 +105,6 @@ impl Rng {
 }
 
 /// Zipf sampler over `n` items with exponent `alpha`.
-///
-/// Precomputes the normalised CDF once, so drawing is a binary search. Web workloads are
-/// close to Zipf, and the exponent is the single knob that decides whether a cache can win
-/// at all, so it is worth sampling exactly rather than approximately.
 #[derive(Debug, Clone)]
 pub struct Zipf {
     cdf: Vec<f64>,

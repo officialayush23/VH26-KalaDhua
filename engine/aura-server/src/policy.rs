@@ -34,8 +34,6 @@ impl Policy {
     }
 
     /// Utility of keeping an object, in the units each classical policy actually optimizes.
-    /// They are deliberately not normalised against each other: the mixture below learns
-    /// the scale it needs.
     pub fn utility(self, f: &Features, age_ms: f64) -> f64 {
         let size = f[idx::LOG_SIZE_BYTES].max(1.0);
         let cost = f[idx::REGEN_COST_USD].max(1e-9);
@@ -52,9 +50,7 @@ impl Policy {
     }
 }
 
-/// Thompson sampling over the six experts. Reward is realised cost avoided per unit of
-/// occupancy, so an arm that keeps cheap objects resident loses even when its hit rate
-/// looks fine.
+/// Thompson sampling over the six experts.
 #[derive(Debug)]
 pub struct Bandit {
     alpha: [f64; 6],
