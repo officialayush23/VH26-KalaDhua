@@ -4,12 +4,17 @@ use aura_core::types::KeyId;
 use aura_sim::{Generator, Scenario};
 use serde::Serialize;
 
+use crate::capacity::CapacityController;
 use crate::engine::Engine;
 use crate::policy::Policy;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchRow {
     pub policy: String,
+    pub capacity_start_bytes: u64,
+    pub capacity_end_bytes: u64,
+    pub mean_resident_bytes: u64,
+    pub holding_cost_usd: f64,
     pub object_hit_rate: f64,
     pub byte_hit_rate: f64,
     pub p95_latency_ms: f64,
@@ -114,14 +119,30 @@ fn parse_policy(s: &str) -> Option<Policy> {
 fn run_aura(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, seed: u64) -> BenchRow {
     let mut c = cfg.clone();
     c.cache.capacity_bytes = capacity;
-    c.capacity.auto = false;
+    // Adaptive capacity is one of the engine's two differentiators and switching it off
+    // here was measuring the other one alone. It stays on, and every byte it decides to
+    // rent is charged at the same price the baselines pay, integrated over time. The
+    // baselines keep a fixed pool because having no way to resize is exactly the gap.
+    c.capacity.auto = true;
+    c.capacity.min_bytes = capacity / 4;
+    c.capacity.max_bytes = capacity * 4;
+    let mut controller = CapacityController::new(&c);
+    let cfg_owned = c.clone();
     let mut eng = Engine::new(c, seed);
     let mut latencies = Vec::new();
     let mut hit_bytes = 0u64;
     let mut total_bytes = 0u64;
+    let mut byte_ms = 0.0f64;
+    let mut last_ts = stream.first().map(|r| r.ts_ms).unwrap_or(0.0);
+    let mut capacity_end = capacity;
 
     for (i, r) in stream.iter().enumerate() {
         total_bytes += r.context.size_bytes;
+        // Occupancy integrated over time is what memory actually costs. Charging the
+        // final size, as this used to, lets a policy hold a huge pool for the whole run
+        // and pay for the instant it happened to end on.
+        byte_ms += eng.store.used_bytes() as f64 * (r.ts_ms - last_ts).max(0.0);
+        last_ts = r.ts_ms;
         match eng.get(r.key_id, &r.context.application, r.ts_ms) {
             Some(_) => {
                 hit_bytes += r.context.size_bytes;
@@ -140,18 +161,28 @@ fn run_aura(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, seed: u64
                 );
             }
         }
-        if i % 10_000 == 0 {
+        if i % 2_000 == 0 {
             eng.recompute_workload();
+            controller.maybe_apply(&mut eng, &cfg_owned);
+            capacity_end = eng.store.capacity_bytes();
         }
     }
 
+    let span_ms = (last_ts - stream.first().map(|r| r.ts_ms).unwrap_or(0.0)).max(1.0);
+    let mean_resident = (byte_ms / span_ms) as u64;
+    let holding = cfg.pricing.holding_cost_usd(mean_resident as f64, span_ms);
+
     BenchRow {
         policy: "aura".into(),
+        capacity_start_bytes: capacity,
+        capacity_end_bytes: capacity_end,
+        mean_resident_bytes: mean_resident,
+        holding_cost_usd: round4(holding),
         object_hit_rate: round4(eng.store.l2_stats.hit_rate()),
         byte_hit_rate: round4(hit_bytes as f64 / total_bytes.max(1) as f64),
         p95_latency_ms: round2(quantile(&mut latencies, 0.95)),
         backend_requests: eng.store.l2_stats.misses,
-        total_cost_usd: round4(eng.ledger.total()),
+        total_cost_usd: round4(eng.ledger.backend_usd + eng.ledger.sla_penalty_usd + holding),
         regen_cost_usd: round4(eng.ledger.backend_usd),
         sla_penalty_usd: round4(eng.ledger.sla_penalty_usd),
         decision_overhead_us_p50: round2(eng.overhead_p50()),
@@ -167,10 +198,14 @@ fn run_classical(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, poli
     let mut cost = 0.0f64;
     let mut penalty = 0.0f64;
     let mut latencies = Vec::new();
+    let mut byte_ms = 0.0f64;
+    let mut last_ts = stream.first().map(|r| r.ts_ms).unwrap_or(0.0);
 
     for r in stream {
         let size = r.context.size_bytes;
         total_bytes += size;
+        byte_ms += used as f64 * (r.ts_ms - last_ts).max(0.0);
+        last_ts = r.ts_ms;
         let c = cfg.pricing.regen_cost_usd(&r.context.regen);
         if let Some(slot) = resident.get_mut(&r.key_id) {
             hits += 1;
@@ -213,10 +248,16 @@ fn run_classical(cfg: &Config, stream: &[aura_sim::Request], capacity: u64, poli
         used += size;
     }
 
-    let holding = cfg.pricing.holding_cost_usd(used as f64, 60_000.0) * (stream.len() as f64 / 5_000.0);
+    let span_ms = (last_ts - stream.first().map(|r| r.ts_ms).unwrap_or(0.0)).max(1.0);
+    let mean_resident = (byte_ms / span_ms) as u64;
+    let holding = cfg.pricing.holding_cost_usd(mean_resident as f64, span_ms);
 
     BenchRow {
         policy: policy.as_str().into(),
+        capacity_start_bytes: capacity,
+        capacity_end_bytes: capacity,
+        mean_resident_bytes: mean_resident,
+        holding_cost_usd: round4(holding),
         object_hit_rate: round4(hits as f64 / (hits + misses).max(1) as f64),
         byte_hit_rate: round4(hit_bytes as f64 / total_bytes.max(1) as f64),
         p95_latency_ms: round2(quantile(&mut latencies, 0.95)),

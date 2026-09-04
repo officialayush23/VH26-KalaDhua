@@ -44,6 +44,15 @@ struct Args {
     models: PathBuf,
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// Store the object bytes for real instead of accounting for them. Without this the
+    /// cache tracks a byte budget but holds no payload, so the reported pool size is a
+    /// simulated budget rather than resident memory.
+    #[arg(long)]
+    real_values: bool,
+    /// Calibrate the analytics rebuild cost from real Supabase queries instead of the
+    /// generator's synthetic figure. Requires Supabase credentials and the seeded tables.
+    #[arg(long)]
+    real_backend: bool,
     /// Start the simulator immediately. Without this the server is a plain cache and only
     /// serves what applications put into it.
     #[arg(long)]
@@ -56,12 +65,26 @@ struct Sim {
     speed: f64,
 }
 
+/// The last measurement taken against the real analytics backend. `measured_ms` of zero
+/// means nothing has been measured yet and the synthetic figure still applies.
+#[derive(Debug, Default, Clone, Copy)]
+struct BackendProbe {
+    enabled: bool,
+    measured_ms: f64,
+    p95_ms: f64,
+    samples: u64,
+    failures: u64,
+    bytes: u64,
+}
+
 struct App {
     engine: Mutex<Engine>,
     capacity: Mutex<CapacityController>,
     sim: Mutex<Option<Sim>>,
     cfg: Config,
     bench: Mutex<Option<BenchmarkReport>>,
+    real_values: bool,
+    probe: Mutex<BackendProbe>,
     tx: broadcast::Sender<String>,
     started: std::time::Instant,
     supabase: Option<supabase::Supabase>,
@@ -115,6 +138,8 @@ async fn main() -> anyhow::Result<()> {
         sim: Mutex::new(sim),
         cfg,
         bench: Mutex::new(None),
+        real_values: args.real_values,
+        probe: Mutex::new(BackendProbe { enabled: args.real_backend, ..Default::default() }),
         tx,
         started: std::time::Instant::now(),
         supabase: sb,
@@ -125,6 +150,17 @@ async fn main() -> anyhow::Result<()> {
     // the bundles land.
     if app.supabase.is_some() {
         tokio::spawn(pull_models(app.clone()));
+    }
+    if args.real_backend {
+        if app.supabase.is_some() {
+            tracing::info!("analytics rebuild cost will be calibrated from live Supabase queries");
+            tokio::spawn(probe_backend(app.clone()));
+        } else {
+            tracing::warn!("--real-backend needs Supabase credentials; falling back to synthetic cost");
+        }
+    }
+    if args.real_values {
+        tracing::info!("storing object payloads for real; pool size is resident memory");
     }
 
     tokio::spawn(drive(app.clone()));
@@ -195,12 +231,29 @@ async fn drive(app: Shared) {
                 let mut sim = app.sim.lock();
                 sim.as_mut().map(|s| s.generator.step(dt_ms)).unwrap_or_default()
             };
+            let measured_db_ms = {
+                let p = app.probe.lock();
+                if p.enabled && p.samples > 0 { p.measured_ms } else { 0.0 }
+            };
+            let real_values = app.real_values;
             let mut eng = app.engine.lock();
             for r in batch {
                 if eng.get(r.key_id, &r.context.application, r.ts_ms).is_none() {
                     let mut measured = r.context.regen;
-                    measured.latency_ms = r.regen_latency_ms;
-                    eng.put(r.key_id, Value::Null, &r.context, measured, r.ts_ms);
+                    let mut latency = r.regen_latency_ms;
+                    // A measured round trip replaces the generator's guess for the one
+                    // application that actually has a database behind it.
+                    if measured_db_ms > 0.0 && r.context.application == "analytics" {
+                        latency = latency - measured.db_ms + measured_db_ms;
+                        measured.db_ms = measured_db_ms;
+                    }
+                    measured.latency_ms = latency;
+                    let payload = if real_values {
+                        Value::String("x".repeat(r.context.size_bytes.min(8_000_000) as usize))
+                    } else {
+                        Value::Null
+                    };
+                    eng.put(r.key_id, payload, &r.context, measured, r.ts_ms);
                 }
             }
             eng.recompute_workload();
@@ -225,6 +278,7 @@ async fn drive(app: Shared) {
 }
 
 fn build_frame(app: &Shared) -> Value {
+    let probe = *app.probe.lock();
     let eng = app.engine.lock();
     let cap = app.capacity.lock();
     let report = cap.report(&eng, &app.cfg);
@@ -345,6 +399,19 @@ fn build_frame(app: &Shared) -> Value {
             "used_bytes": eng.store.used_bytes(),
             "capacity_bytes": eng.store.capacity_bytes(),
             "decision_overhead_us_p50": round2(eng.overhead_p50())
+        },
+        "fidelity": {
+            "traffic": "simulated",
+            "values_stored": app.real_values,
+            "backend": {
+                "enabled": probe.enabled,
+                "measured": probe.samples > 0,
+                "measured_db_ms": round2(probe.measured_ms),
+                "p95_db_ms": round2(probe.p95_ms),
+                "samples": probe.samples,
+                "failures": probe.failures,
+                "response_bytes": probe.bytes
+            }
         },
         "applications": apps,
         "events": eng.events.iter().rev().take(20).collect::<Vec<_>>(),
@@ -957,6 +1024,47 @@ async fn pull_models(app: Shared) {
         let detail = loaded.join(", ");
         app.engine.lock().push_event("ModelReload", &format!("supabase: {detail}"));
         tracing::info!(models = %detail, "models loaded from supabase");
+    }
+}
+
+/// Measures the real backend every few seconds rather than on every miss. One genuine
+/// query per interval is enough to keep the cost model honest, and querying on every miss
+/// would generate thousands of requests a second against a hosted database.
+async fn probe_backend(app: Shared) {
+    let sb = match app.supabase.as_ref() {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let mut ticker = tokio::time::interval(Duration::from_secs(3));
+    let mut region = 1i32;
+    let mut seen: Vec<f64> = Vec::new();
+    loop {
+        ticker.tick().await;
+        region = region % 25 + 1;
+        match sb.probe_analytics(region, 90).await {
+            Ok((ms, bytes)) => {
+                seen.push(ms);
+                if seen.len() > 64 {
+                    seen.remove(0);
+                }
+                let mut sorted = seen.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let p95 = sorted[((sorted.len() - 1) as f64 * 0.95).round() as usize];
+                let mean = seen.iter().sum::<f64>() / seen.len() as f64;
+                let mut p = app.probe.lock();
+                p.measured_ms = mean;
+                p.p95_ms = p95;
+                p.samples += 1;
+                p.bytes = bytes;
+            }
+            Err(e) => {
+                let mut p = app.probe.lock();
+                p.failures += 1;
+                if p.failures % 10 == 1 {
+                    tracing::warn!("analytics probe failed: {e}");
+                }
+            }
+        }
     }
 }
 

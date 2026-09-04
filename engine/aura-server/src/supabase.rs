@@ -216,6 +216,36 @@ impl Supabase {
 
     /// Round-trips the REST endpoint so the dashboard can show whether the project is
     /// actually reachable rather than merely configured.
+    /// Runs a genuine aggregate against the seeded analytics tables and returns how long
+    /// Supabase actually took. This is the difference between a cost model fed by a made-up
+    /// number and one fed by a measurement: the query is executed by the database, over the
+    /// network, and the wall clock is what the engine learns from.
+    pub async fn probe_analytics(&self, region_id: i32, days: i64) -> anyhow::Result<(f64, u64)> {
+        // PostgREST compares against a literal, so the cutoff has to be a real timestamp.
+        // Sending `now()-90days` would be matched as a string and quietly return nothing.
+        let since = iso_days_ago(days);
+        let url = format!("{}/rest/v1/app_order_totals", self.base_url);
+        let started = std::time::Instant::now();
+        let res = self
+            .req(self.client.get(&url))
+            .header("prefer", "count=exact")
+            .query(&[
+                ("region_id", format!("eq.{region_id}")),
+                ("placed_at", format!("gte.{since}")),
+                ("select", "order_id,order_total,line_count".to_string()),
+                ("limit", "1000".to_string()),
+            ])
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.bytes().await?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if !status.is_success() {
+            anyhow::bail!("analytics probe failed: {status}");
+        }
+        Ok((elapsed_ms, body.len() as u64))
+    }
+
     pub async fn health(&self) -> bool {
         let url = self.rest(MODELS_TABLE);
         match self
@@ -228,6 +258,35 @@ impl Supabase {
             Err(_) => false,
         }
     }
+}
+
+/// UTC timestamp `days` in the past, formatted for PostgREST. Written out rather than
+/// pulling in a date library for one call.
+fn iso_days_ago(days: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = now - days * 86_400;
+    let days_since_epoch = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+
+    // Civil-from-days, Howard Hinnant's algorithm.
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60
+    )
 }
 
 fn first_env(names: &[&str]) -> Option<String> {
@@ -274,4 +333,23 @@ pub fn load_dotenv() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::iso_days_ago;
+
+    #[test]
+    fn iso_timestamp_is_well_formed_and_in_the_past() {
+        let now = iso_days_ago(0);
+        let past = iso_days_ago(90);
+        assert_eq!(now.len(), 20, "{now}");
+        assert!(now.ends_with('Z'));
+        assert!(past < now, "{past} should sort before {now}");
+        let year: i32 = now[..4].parse().unwrap();
+        assert!((2020..2100).contains(&year), "{now}");
+        let month: u32 = now[5..7].parse().unwrap();
+        let day: u32 = now[8..10].parse().unwrap();
+        assert!((1..=12).contains(&month) && (1..=31).contains(&day), "{now}");
+    }
 }
