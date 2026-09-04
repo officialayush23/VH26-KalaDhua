@@ -571,6 +571,14 @@ impl Engine {
         evicted
     }
 
+    /// Value density of an object already resident, on the *same scale* as
+    /// [`Engine::value_density`].
+    ///
+    /// These two were previously computed by different formulas in different units, which
+    /// silently disabled admission control: an arrival scored in the thousands was always
+    /// going to clear a bar scored below one, so nothing was ever refused. Both sides now
+    /// end in the same expression, and the only thing the expert blend and the model do is
+    /// supply the reuse estimate that expression consumes.
     fn resident_density(&self, key: KeyId, now_ms: f64) -> f64 {
         let e = match self.store.get(key) {
             Some(e) => e,
@@ -589,26 +597,37 @@ impl Engine {
             &e.regen,
             ambient,
         );
+        let age = e.age_ms(now_ms);
+
+        // An operator forcing a single policy wants that policy's ranking verbatim, not a
+        // blend, so this path returns before any of the economics.
+        if let Some(p) = self.override_policy {
+            return p.utility(&f, age);
+        }
+
         let cost = self.cfg.pricing.regen_cost_usd(&e.regen);
         let mixture = self.bandit.mixture();
-        let age = e.age_ms(now_ms);
-        // The expert blend and the learned score are combined rather than one overriding
-        // the other: when the model is cold, the classical policies still carry the cache.
         let expert: f64 = Policy::ALL
             .iter()
             .enumerate()
             .map(|(i, p)| mixture[i] * p.utility(&f, age))
             .sum();
-        let ml_share = self.cfg.engine.ml_confidence_floor.max(self.predictor.confidence());
-        let learned = {
-            let reuse_proxy = (f[idx::EWMA_FAST] + f[idx::FREQ_1M]).min(6.0) / 6.0;
-            cost * reuse_proxy / (e.size_bytes as f64).max(1.0) * 1e9
-        };
-        let combined = expert * (1.0 - ml_share) + learned * ml_share;
-        if let Some(p) = self.override_policy {
-            return p.utility(&f, age);
-        }
-        combined * e.ttl_remaining_frac(now_ms).max(0.05)
+        // The experts rank objects but do not speak probabilities. Squashing turns the
+        // blended score into something on the same [0, 1) footing as the model output so
+        // the two can be mixed at all.
+        let expert_reuse = expert / (1.0 + expert.max(0.0));
+        let model_reuse = self.predictor.reuse_peek(&f);
+        let share = self
+            .cfg
+            .engine
+            .ml_confidence_floor
+            .max(self.predictor.confidence())
+            .clamp(0.0, 1.0);
+
+        let blended = |model: f64| expert_reuse * (1.0 - share) + model * share;
+        let reuse = [blended(model_reuse[0]), blended(model_reuse[1]), blended(model_reuse[2])];
+
+        self.value_density(&f, reuse, e.size_bytes, cost) * e.ttl_remaining_frac(now_ms).max(0.05)
     }
 
     /// Density of the weakest resident object a sample can find.

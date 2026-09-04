@@ -192,6 +192,21 @@ impl Predictor {
         ]
     }
 
+    /// Reuse estimate without recording an inference. Eviction scores many objects per
+    /// admission, and counting each of those as a prediction would make the inference
+    /// counter meaningless.
+    pub fn reuse_peek(&self, f: &Features) -> [f64; 3] {
+        let fallback = self.online.predict(f);
+        [
+            self.h10.as_ref().map(|b| score(b, f)).unwrap_or(fallback * 0.55),
+            self.h60.as_ref().map(|b| score(b, f)).unwrap_or(fallback),
+            self.h600
+                .as_ref()
+                .map(|b| score(b, f))
+                .unwrap_or(1.0 - (1.0 - fallback).powf(0.55)),
+        ]
+    }
+
     pub fn observe(&mut self, f: &Features, reused: bool) {
         self.online.update(f, if reused { 1.0 } else { 0.0 });
     }
