@@ -1,0 +1,60 @@
+# The AURA engine. Multi-stage: a fat build image, a thin runtime image.
+#
+# The runtime layer carries a single statically-linkable binary and a config file. There is
+# no interpreter, no package manager and no source tree in the shipped image, which is what
+# keeps it small enough to redeploy in seconds and leaves nothing to audit.
+
+# ---------------------------------------------------------------- build
+FROM rust:1.83-slim-bookworm AS build
+
+WORKDIR /build
+
+# Dependencies are their own layer. Cargo re-resolves the whole graph whenever any manifest
+# changes, so copying manifests first and building a stub means a source edit rebuilds only
+# our crates — seconds instead of minutes.
+COPY engine/Cargo.toml ./Cargo.toml
+COPY engine/aura-core/Cargo.toml ./aura-core/Cargo.toml
+COPY engine/aura-sim/Cargo.toml ./aura-sim/Cargo.toml
+COPY engine/aura-server/Cargo.toml ./aura-server/Cargo.toml
+RUN mkdir -p aura-core/src aura-sim/src aura-server/src \
+ && echo "" > aura-core/src/lib.rs \
+ && echo "" > aura-sim/src/lib.rs \
+ && echo "fn main() {}" > aura-server/src/main.rs \
+ && cargo build --release --locked 2>/dev/null || cargo build --release
+
+COPY engine/ ./
+# Cargo caches by mtime; the stub sources above are newer than the real ones we just copied.
+RUN touch aura-core/src/lib.rs aura-sim/src/lib.rs aura-server/src/main.rs \
+ && cargo build --release -p aura-server
+
+# ---------------------------------------------------------------- runtime
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Never root. The engine reads a config file and writes nothing outside /app/models.
+RUN useradd --system --create-home --uid 10001 aura
+WORKDIR /app
+
+COPY --from=build /build/target/release/aura-server /usr/local/bin/aura
+COPY engine/config/ /app/config/
+RUN mkdir -p /app/models && chown -R aura:aura /app
+
+USER aura
+EXPOSE 8080
+
+# The container is unhealthy the moment the engine stops answering, not merely when the
+# process dies: a cache that is up but wedged is worse than one that has crashed, because
+# nothing restarts it.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -fsS http://localhost:8080/healthz || exit 1
+
+# --real-values by default. The memory-scaling behaviour must be real in a deployed image;
+# the accounting-only mode exists for fast benchmark sweeps, not for anything shipped.
+ENTRYPOINT ["aura"]
+# --real-values because the memory-scaling behaviour must be real in anything deployed.
+# --real-backend because the analytics application has an actual database behind it, and a
+# rebuild cost that came from a generator is not a measurement.
+CMD ["--bind", "0.0.0.0:8080", "--config", "/app/config/default.toml", "--models", "/app/models", "--real-values", "--real-backend"]

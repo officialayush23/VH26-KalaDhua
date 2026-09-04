@@ -116,7 +116,11 @@ HORIZONS_MS: tuple[int, ...] = (10_000, 60_000, 600_000)
 PORTABLE_INDEX: tuple[int, ...] = tuple(FEATURE_NAMES.index(name) for name in PORTABLE_FEATURES)
 
 assert len(PORTABLE_FEATURES) == 12
-assert set(PORTABLE_FEATURES) | set(DROPPED_FEATURES) == set(FEATURE_NAMES)
+# The engine's vector is wider than this: it also carries the eight extra signals. What has
+# to hold is that every base feature is accounted for as either portable or deliberately
+# dropped, so nothing is forgotten silently.
+_BASE = set(FEATURE_NAMES[:16]) if len(FEATURE_NAMES) >= 16 else set(FEATURE_NAMES)
+assert set(PORTABLE_FEATURES) | set(DROPPED_FEATURES) == _BASE
 
 
 def horizon_label(ms: int) -> str:

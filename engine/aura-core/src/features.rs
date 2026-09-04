@@ -19,7 +19,20 @@ use crate::types::{app_id, CostVector, KeyId};
 use ahash::AHashMap;
 
 /// Number of features in the vector the models consume.
-pub const N_FEATURES: usize = 16;
+/// Sixteen base features plus the eight extra signals from [`crate::signals`].
+///
+/// The base sixteen are computed here and pinned by the golden fixture shared with the
+/// training pipeline. The extra eight are computed by `SignalBuilder` and written into
+/// slots 16..24 by the engine, because they need per-application state this builder does
+/// not carry.
+///
+/// A trained model does not have to use all of them. The bundle names the columns it wants
+/// and the loader projects this vector onto them, so the engine and the trainer can evolve
+/// their feature sets independently.
+pub const N_FEATURES: usize = 24;
+
+/// Where the extra signals begin.
+pub const EXTRA_OFFSET: usize = 16;
 
 /// Feature names, in contract order. Serialised into every model bundle and checked on
 /// load, so a bundle trained against a different vector is rejected rather than silently
@@ -41,6 +54,15 @@ pub const FEATURE_NAMES: [&str; N_FEATURES] = [
     "ttl_remaining_frac",
     "cache_pressure",
     "app_id",
+    // --- from signals.rs, written by the engine into slots 16..24 ---
+    "size_percentile",
+    "cost_percentile",
+    "cost_variance_ratio_app",
+    "log_reuse_distance",
+    "burstiness",
+    "novelty_rate",
+    "hour_sin",
+    "hour_cos",
 ];
 
 /// A dense feature vector. Fixed size, `Copy`, never heap-allocated on the hot path.
@@ -253,7 +275,7 @@ impl FeatureBuilder {
         // 12 — the priced cost vector.
         let regen_cost_usd = self.pricing.regen_cost_usd(&event.regen);
 
-        [
+        let base: [f64; EXTRA_OFFSET] = [
             log_age_ms,
             log_inter_arrival_ms,
             freqs[0],
@@ -270,7 +292,12 @@ impl FeatureBuilder {
             ambient.ttl_remaining_frac,
             ambient.cache_pressure,
             app_id(&event.application) as f64,
-        ]
+        ];
+        // Slots 16..24 stay zero here. The engine fills them from `SignalBuilder`, which
+        // keeps per-application distributions this builder has no business owning.
+        let mut out = [0.0f64; N_FEATURES];
+        out[..EXTRA_OFFSET].copy_from_slice(&base);
+        out
     }
 
     /// Rebuild a feature vector for a resident object *without* recording an access.
@@ -436,8 +463,11 @@ mod tests {
         };
         let capacity = cfg_json["sim_capacity_bytes"].as_u64().unwrap();
 
+        // The fixture pins the base sixteen. The extra eight are computed elsewhere and
+        // have their own tests, so the fixture must match this vector's *prefix*, not its
+        // whole length.
         let names = doc["feature_names"].as_array().expect("feature_names");
-        assert_eq!(names.len(), N_FEATURES);
+        assert_eq!(names.len(), EXTRA_OFFSET, "the golden fixture covers the base features");
         for (i, n) in names.iter().enumerate() {
             assert_eq!(n.as_str().unwrap(), FEATURE_NAMES[i], "feature order drifted at {i}");
         }
@@ -474,7 +504,7 @@ mod tests {
             replica.touch(event.key_id, event.ts_ms, event.size_bytes, event.ttl_ms);
 
             let want = case["features"].as_array().unwrap();
-            for i in 0..N_FEATURES {
+            for i in 0..EXTRA_OFFSET {
                 let w = want[i].as_f64().unwrap();
                 let g = got[i];
                 assert!(

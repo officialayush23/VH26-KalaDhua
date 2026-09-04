@@ -25,6 +25,40 @@ pub struct ModelBundle {
     pub linear_weights: Option<LinearWeights>,
     #[serde(default)]
     pub metrics: serde_json::Value,
+
+    /// Engine feature index for each of the bundle's own columns, resolved at load time.
+    ///
+    /// Without this, `score` would feed the engine's whole feature array in positionally,
+    /// so a bundle trained on a subset would read the wrong columns — no error, no warning,
+    /// just confident nonsense. Not serialised: it is derived from `feature_names`.
+    #[serde(skip)]
+    pub projection: Option<Vec<usize>>,
+}
+
+/// Map each of a bundle's declared feature names onto this engine's feature index.
+///
+/// Returns an error naming every unknown feature rather than silently dropping columns. A
+/// bundle asking for something this engine does not compute is a version mismatch, and the
+/// only safe response is to refuse it and keep serving with whatever was loaded before.
+fn resolve_projection(names: &[String]) -> anyhow::Result<Vec<usize>> {
+    use aura_core::features::FEATURE_NAMES;
+
+    let mut projection = Vec::with_capacity(names.len());
+    let mut unknown = Vec::new();
+    for name in names {
+        match FEATURE_NAMES.iter().position(|f| *f == name.as_str()) {
+            Some(idx) => projection.push(idx),
+            None => unknown.push(name.clone()),
+        }
+    }
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "model bundle needs features this engine does not compute: {}. Engine features: {}",
+            unknown.join(", "),
+            FEATURE_NAMES.join(", ")
+        );
+    }
+    Ok(projection)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +176,16 @@ impl Predictor {
         Ok(p)
     }
 
-    pub fn load_bundle(&mut self, bundle: ModelBundle, source: &str) {
+    pub fn load_bundle(&mut self, mut bundle: ModelBundle, source: &str) {
+        match resolve_projection(&bundle.feature_names) {
+            Ok(projection) => bundle.projection = Some(projection),
+            Err(err) => {
+                // Keeping the previous predictor is the conservative outcome: a stale model
+                // beats a mis-indexed one, and a mis-indexed one fails silently.
+                tracing::error!(name = %bundle.name, %source, %err, "rejected model bundle");
+                return;
+            }
+        }
         self.kind = if bundle.trees.is_empty() {
             PredictorKind::Linear
         } else {
@@ -263,8 +306,14 @@ fn score(b: &ModelBundle, f: &Features) -> f64 {
 }
 
 fn normalize(b: &ModelBundle, f: &Features) -> Vec<f64> {
+    // Gather the columns this bundle was trained on. A twenty-feature model must not read
+    // the engine's first twenty slots, because those are not the same twenty.
+    let picked: Vec<f64> = match &b.projection {
+        Some(p) => p.iter().map(|&i| f.get(i).copied().unwrap_or(0.0)).collect(),
+        None => f.to_vec(),
+    };
     match &b.normalization {
-        Some(n) => f
+        Some(n) => picked
             .iter()
             .enumerate()
             .map(|(i, v)| {
@@ -277,7 +326,7 @@ fn normalize(b: &ModelBundle, f: &Features) -> Vec<f64> {
                 }
             })
             .collect(),
-        None => f.to_vec(),
+        None => picked,
     }
 }
 
@@ -347,4 +396,59 @@ impl OnlineLogistic {
 /// usable across all of them without maintaining a separate scaler.
 fn squash(v: f64) -> f64 {
     (v / (1.0 + v.abs())).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use aura_core::features::{idx, FEATURE_NAMES, N_FEATURES};
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bundle_may_use_a_subset_of_the_engine_features() {
+        let p = resolve_projection(&names(&["trend", "freq_1m", "log_size_bytes"]))
+            .expect("all three are engine features");
+        assert_eq!(p, vec![idx::TREND, idx::FREQ_1M, idx::LOG_SIZE_BYTES]);
+    }
+
+    #[test]
+    fn an_unknown_feature_is_rejected_rather_than_ignored() {
+        let err = resolve_projection(&names(&["trend", "phase_of_the_moon"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phase_of_the_moon"), "the error must name what is missing: {err}");
+    }
+
+    #[test]
+    fn projection_follows_the_bundle_order_not_the_engine_order() {
+        let p = resolve_projection(&names(&["log_size_bytes", "log_age_ms"])).unwrap();
+        let mut f = [0.0f64; N_FEATURES];
+        f[idx::LOG_AGE_MS] = 1.5;
+        f[idx::LOG_SIZE_BYTES] = 9.5;
+        let picked: Vec<f64> = p.iter().map(|&i| f[i]).collect();
+        assert_eq!(picked, vec![9.5, 1.5], "the bundle's order is what counts");
+    }
+
+    #[test]
+    fn the_twenty_portable_features_all_exist_in_this_engine() {
+        // The exact list `training/portable.py` writes into every bundle. If this fails,
+        // the trainer and the engine have drifted and no bundle will load.
+        let portable = names(&[
+            "log_age_ms", "log_inter_arrival_ms", "freq_1m", "freq_5m", "freq_1h",
+            "ewma_fast", "ewma_slow", "trend", "acceleration", "log_size_bytes",
+            "ttl_remaining_frac", "cache_pressure",
+            "size_percentile", "cost_percentile", "cost_variance_ratio_app",
+            "log_reuse_distance", "burstiness", "novelty_rate", "hour_sin", "hour_cos",
+        ]);
+        let p = resolve_projection(&portable).expect("every portable feature must exist");
+        assert_eq!(p.len(), 20);
+        // And none of them is one of the platform-bound features we deliberately dropped.
+        for dropped in ["regen_cost_usd", "log_regen_p50_ms", "app_id"] {
+            let i = FEATURE_NAMES.iter().position(|f| *f == dropped).unwrap();
+            assert!(!p.contains(&i), "{dropped} must not be in a portable bundle");
+        }
+    }
 }

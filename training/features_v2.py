@@ -31,7 +31,7 @@ The eight added here
     the model without breaking portability** — a 90th-percentile-expensive object is a
     90th-percentile-expensive object whether the currency is GPU-seconds or database time.
 
-``cost_variance_ratio``
+``cost_variance_ratio_app``
     ``regen_p95 / regen_p50`` for the operation class. Already a ratio, so already portable —
     dropping it earlier was an over-correction. A miss whose cost you cannot predict is worse
     than one you can, and this is the only feature that says so.
@@ -81,7 +81,10 @@ from typing import Iterable, Sequence
 EXTRA_FEATURES: tuple[str, ...] = (
     "size_percentile",
     "cost_percentile",
-    "cost_variance_ratio",
+    # Suffixed because the base vector already carries a `cost_variance_ratio` computed per
+    # (application, object_type). This one is per application, and two features sharing a
+    # name is the kind of collision that mis-scores a model in total silence.
+    "cost_variance_ratio_app",
     "log_reuse_distance",
     "burstiness",
     "novelty_rate",
@@ -105,14 +108,25 @@ class QuantileLadder:
         self.lr = lr
         self.levels: list[float] = [0.0] * len(_LADDER)
         self.seen = 0
+        # Running mean magnitude, used only to floor the step size. The step is
+        # multiplicative and therefore scale-free by construction, but a level sitting at
+        # exactly zero would never move. A fixed floor of 1.0 is the obvious fix and is
+        # wrong: it is enormous next to a cost of 0.000002 and negligible next to a latency
+        # of 2000, so the ladder converges at one scale and not the other. Flooring against
+        # the data's own magnitude keeps the percentile portable, which is the entire
+        # reason `cost_percentile` can replace absolute cost in the model.
+        self.mean_abs = 0.0
 
     def observe(self, x: float) -> None:
         if self.seen == 0:
             self.levels = [x] * len(_LADDER)
+            self.mean_abs = abs(x)
             self.seen = 1
             return
+        self.mean_abs = 0.05 * abs(x) + 0.95 * self.mean_abs
+        floor = self.mean_abs * 1e-3 if self.mean_abs > 0.0 else 5e-324
         for i, q in enumerate(_LADDER):
-            step = self.lr * max(abs(self.levels[i]), 1.0)
+            step = self.lr * max(abs(self.levels[i]), floor)
             self.levels[i] += step * q if x > self.levels[i] else -step * (1.0 - q)
         # Keep the ladder monotone; SGD on independent levels can cross them.
         for i in range(1, len(self.levels)):

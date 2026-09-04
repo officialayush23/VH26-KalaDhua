@@ -90,9 +90,13 @@ impl Gds {
         self
     }
 
-    /// The whole policy: value per byte, above the inflation floor. No frequency term —
-    /// that is precisely what separates it from GDSF.
-    fn priority(&self, entry: &Resident) -> f64 {
+    /// The whole policy: value per byte, above the inflation floor at the moment of
+    /// admission. No frequency term — that is precisely what separates it from GDSF.
+    ///
+    /// Called once, when the object enters. The result is stored on the entry and never
+    /// recomputed, because `L` is a floor for *new arrivals*, not a tide that lifts
+    /// everything already resident.
+    fn priority_at_admission(&self, entry: &Resident) -> f64 {
         let cost = if entry.cost_usd > 0.0 { entry.cost_usd } else { self.default_cost_usd };
         self.inflation + cost / (entry.size_bytes.max(1) as f64)
     }
@@ -103,22 +107,40 @@ impl Gds {
     }
 
     fn evict_until_fits(&mut self, needed: u64, evicted: &mut Vec<KeyId>) {
-        while self.used_bytes + needed > self.capacity_bytes {
-            let Some(item) = self.heap.pop() else { break };
+        while self.used_bytes + needed > self.capacity_bytes && !self.entries.is_empty() {
+            let Some(item) = self.heap.pop() else {
+                // The heap can run dry while entries remain: lazy deletion leaves stale
+                // records, and skipping them consumes the heap faster than it is refilled.
+                // Rebuilding from the authoritative map is O(n) but happens rarely, and the
+                // alternative is silently exceeding the byte budget.
+                self.rebuild_heap();
+                if self.heap.is_empty() {
+                    break;
+                }
+                continue;
+            };
             let Some(entry) = self.entries.get(&item.key) else { continue };
-            let current = self.priority(entry);
             // Lazy deletion: a key can appear several times, and only the record matching
-            // its current priority is authoritative.
-            if (-item.score - current).abs() > 1e-12 {
+            // its stored priority is authoritative.
+            if (-item.score - entry.score).abs() > 1e-12 {
                 continue;
             }
             let size = entry.size_bytes;
-            // The victim's priority becomes the floor. Nothing still resident can now be
-            // considered worth less than what we just gave up.
-            self.inflation = current;
+            // The victim's priority becomes the floor for everything admitted afterwards.
+            self.inflation = entry.score;
             self.entries.remove(&item.key);
             self.used_bytes -= size;
             evicted.push(item.key);
+        }
+    }
+
+    /// Discard stale heap records and re-seed from the entries that actually exist.
+    fn rebuild_heap(&mut self) {
+        self.heap.clear();
+        let snapshot: Vec<(KeyId, f64)> =
+            self.entries.iter().map(|(k, e)| (*k, e.score)).collect();
+        for (key, score) in snapshot {
+            self.push(key, score);
         }
     }
 
@@ -128,9 +150,16 @@ impl Gds {
             return result;
         }
         self.evict_until_fits(req.size_bytes, &mut result.evicted);
+        // Eviction can fail to free enough — every remaining object may be larger than what
+        // was asked for. Admitting anyway would put the cache over its budget, which is the
+        // one invariant a cache may never break.
+        if self.used_bytes + req.size_bytes > self.capacity_bytes {
+            return result;
+        }
         let cost = self.pricing.regen_cost_usd(&req.regen);
-        let entry = Resident::new(req, 0, cost);
-        let priority = self.priority(&entry);
+        let mut entry = Resident::new(req, 0, cost);
+        entry.score = self.priority_at_admission(&entry);
+        let priority = entry.score;
         self.entries.insert(req.key, entry);
         self.used_bytes += req.size_bytes;
         self.push(req.key, priority);
@@ -254,17 +283,34 @@ mod tests {
     }
 
     #[test]
-    fn gdsf_beats_gds_when_frequency_matters() {
-        // The reason GDSF exists. Uniform cost and size, so the only usable signal is
-        // frequency — which GDS cannot see at all.
-        use crate::policies::testkit::zipf_hit_rate;
-        let mut gds = Gds::new(200 * 100);
-        let mut gdsf = Gdsf::new(200 * 100);
-        let gds_hr = zipf_hit_rate(&mut gds, 5_000, 120_000, 100);
-        let gdsf_hr = zipf_hit_rate(&mut gdsf, 5_000, 120_000, 100);
+    fn only_gdsf_protects_a_frequently_used_object() {
+        // The defining difference, tested directly rather than statistically. Identical
+        // cost and size for every object, so frequency is the only signal available. GDS
+        // has no frequency term and therefore cannot act on it; GDSF can.
+        fn survives_hammering<P: CachePolicy>(mut cache: P) -> bool {
+            let cost = cheap();
+            // Four objects fill a cache sized for four.
+            for k in 1..=4u64 {
+                cache.access(&Request::new(k as f64, k, 100).with_regen(cost));
+            }
+            // Key 1 is used forty more times. Every other object is touched once.
+            for i in 0..40 {
+                cache.access(&Request::new(10.0 + i as f64, 1, 100).with_regen(cost));
+            }
+            // Now force four evictions with fresh arrivals.
+            for i in 0..4u64 {
+                cache.access(&Request::new(100.0 + i as f64, 500 + i, 100).with_regen(cost));
+            }
+            cache.contains(1)
+        }
+
         assert!(
-            gdsf_hr > gds_hr,
-            "with uniform cost, frequency should win: gdsf {gdsf_hr:.3} vs gds {gds_hr:.3}"
+            survives_hammering(Gdsf::new(400)),
+            "GDSF must protect the frequently used object - that is its whole addition"
+        );
+        assert!(
+            !survives_hammering(Gds::new(400)),
+            "GDS has no frequency term and must not appear to act on frequency"
         );
     }
 

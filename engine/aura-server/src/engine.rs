@@ -2,11 +2,14 @@ use std::collections::VecDeque;
 
 use ahash::AHashMap;
 use aura_core::config::Config;
-use aura_core::features::{idx, AccessEvent, AmbientState, FeatureBuilder, Features};
+use aura_core::features::{idx, AccessEvent, AmbientState, FeatureBuilder, Features, EXTRA_OFFSET};
+use aura_core::signals::SignalBuilder;
 use aura_core::rng::Rng;
 use aura_core::types::{Action, CostVector, Decision, KeyId, ObjectContext};
 use serde::Serialize;
 
+use crate::audit::{self, AuditKind, AuditLog, Fact, Severity};
+use crate::feedback::{Journal, JournalStats, TrainingRow};
 use crate::policy::{round4, Bandit, Policy, Regime, WorkloadFeatures};
 use crate::predictor::Predictor;
 use crate::store::{Entry, Store};
@@ -189,8 +192,15 @@ pub struct Engine {
     pub cfg: Config,
     pub store: Store,
     pub features: FeatureBuilder,
+    /// The eight extra signals. Separate from `features` because they carry
+    /// per-application distributions rather than per-key counters.
+    pub signals: SignalBuilder,
     pub predictor: Predictor,
     pub bandit: Bandit,
+    /// Decisions awaiting the future that will judge them. See `feedback.rs`.
+    pub journal: Journal,
+    /// What the cache did, in words. See `audit.rs`.
+    pub audit: AuditLog,
     pub ledger: CostLedger,
     pub shadows: Vec<Shadow>,
     pub apps: AHashMap<String, AppStats>,
@@ -225,6 +235,7 @@ impl Engine {
         let l1_window = ((capacity / 32_768).max(1_024) as usize).min(200_000);
         let store = Store::new(capacity, l1_window);
         let features = FeatureBuilder::new(cfg.features, cfg.pricing);
+        let signals = SignalBuilder::new(2_000, cfg.features.quantile_lr);
         let predictor = Predictor::heuristic(cfg.predictor.online_lr);
         let bandit = Bandit::new(cfg.bandit.exploration, seed ^ 0x9E37);
         let shadows = [Policy::Lru, Policy::Lfu, Policy::Gdsf]
@@ -235,8 +246,11 @@ impl Engine {
             cfg,
             store,
             features,
+            signals,
             predictor,
             bandit,
+            journal: Journal::new(),
+            audit: AuditLog::default(),
             ledger: CostLedger::default(),
             shadows,
             apps: AHashMap::new(),
@@ -285,6 +299,10 @@ impl Engine {
         self.requests += 1;
         self.window_requests += 1;
         self.track_arrival(key, now_ms);
+        // The future arriving for decisions taken earlier. A miss counts as reuse just as
+        // much as a hit: the label answers "was this wanted again", and counting only hits
+        // would teach the model that whatever the cache kept was the right thing to keep.
+        self.journal.observe_access(key, now_ms);
 
         let l1_seen = self.store.touch_l1(key, now_ms);
         self.store.l1_stats.record(l1_seen, 0);
@@ -439,7 +457,18 @@ impl Engine {
             regen,
             regen_latency_ms: latency,
         };
-        let f = self.features.transform(&event, ambient);
+        let mut f = self.features.transform(&event, ambient);
+        // The extra signals need the same read-then-fold discipline, so they are computed
+        // from the same event at the same instant rather than reconstructed later.
+        let extra = self.signals.transform(
+            key,
+            now_ms,
+            &ctx.application,
+            ctx.size_bytes,
+            cost_usd,
+            latency,
+        );
+        f[EXTRA_OFFSET..].copy_from_slice(&extra);
 
         let reuse = self.predictor.reuse(&f);
         let value_density = self.value_density(&f, reuse, ctx.size_bytes, cost_usd);
@@ -501,16 +530,33 @@ impl Engine {
             Decision::new(Action::Reject, reason_code)
         };
 
+        self.write_audit(key, ctx, &decision, reuse, cost_usd, value_density, threshold, &regen, evicted.len());
         self.record_explain(key, ctx, &decision, &f, reuse, cost_usd, value_density);
         self.observe_reuse(key, now_ms, false);
 
+        // The decision is written down and left alone. Crediting the bandit here, from the
+        // score that produced the decision, would be the system grading its own homework:
+        // it would learn that its own confidence was justified, whatever actually happened.
+        // `settle_feedback` credits it sixty seconds later, from the outcome.
         let credited = self.override_policy.unwrap_or_else(|| self.bandit.sample_arm());
-        let reward = if decision.action == Action::Admit {
-            (value_density / (threshold.max(1e-9) * 4.0)).clamp(0.0, 1.0)
-        } else {
-            (1.0 - reuse[1]).clamp(0.0, 1.0) * 0.7
-        };
-        self.bandit.credit(credited, reward);
+        let holding_usd = self
+            .cfg
+            .pricing
+            .holding_cost_usd(ctx.size_bytes as f64, crate::feedback::HORIZONS_MS[1]);
+        self.journal.record(
+            key,
+            &ctx.application,
+            f,
+            reuse,
+            credited,
+            decision.action == Action::Admit,
+            value_density,
+            threshold,
+            cost_usd,
+            holding_usd,
+            ctx.size_bytes,
+            now_ms,
+        );
 
         let us = t0.elapsed().as_secs_f64() * 1e6;
         if self.decision_overhead_us.len() >= 2_048 {
@@ -759,6 +805,141 @@ impl Engine {
             self.explains.pop_front();
         }
         self.explains.push_back(rec);
+    }
+
+    /// Close the loop: judge decisions whose sixty-second verdict is now in.
+    ///
+    /// This is the only place the bandit is rewarded and the only place the online model is
+    /// corrected. Both learn from what actually happened rather than from what was
+    /// predicted, which is the difference between a system that adapts and one that
+    /// confirms its own priors.
+    pub fn settle_feedback(&mut self, limit: usize) -> usize {
+        let settled = self.journal.settle(self.now_ms, limit);
+        for s in &settled {
+            self.bandit.credit(s.policy, s.reward);
+            // The 60-second label is the one that is both meaningful and available quickly
+            // enough to steer a live cache.
+            self.predictor.observe(&s.features, s.reused[1]);
+        }
+        // Retire fully matured records into training rows for the next model.
+        self.journal.retire(self.now_ms, limit * 4);
+        settled.len()
+    }
+
+    pub fn journal_stats(&self) -> JournalStats {
+        self.journal.stats()
+    }
+
+    /// Drain finished training rows. `GET /v1/training/rows` serves these, and the trainer
+    /// reads them: the cache produces its own training data as a by-product of running.
+    pub fn drain_training_rows(&mut self, n: usize) -> Vec<TrainingRow> {
+        self.journal.drain_completed(n)
+    }
+
+    /// Turn one decision into a sentence, with the numbers that produced it.
+    ///
+    /// Kept out of `put` so the hot path reads as a decision procedure rather than a
+    /// logging routine, and so the sampling policy lives in one place.
+    #[allow(clippy::too_many_arguments)]
+    fn write_audit(
+        &mut self,
+        key: KeyId,
+        ctx: &ObjectContext,
+        decision: &Decision,
+        reuse: [f64; 3],
+        cost_usd: f64,
+        density: f64,
+        threshold: f64,
+        regen: &CostVector,
+        evicted: usize,
+    ) {
+        let name = format!("{}:{}", ctx.application, key);
+        let facts = vec![
+            Fact::new("size", audit::bytes(ctx.size_bytes)),
+            Fact::new("reuse_60s", audit::percent(reuse[1])),
+            Fact::new("rebuild_cost", audit::usd(cost_usd)),
+            Fact::new("value_density", format!("{density:.2}")),
+            Fact::new("bar", format!("{threshold:.2}")),
+        ];
+
+        match decision.action {
+            Action::Admit => {
+                // An expensive object is worth a line of its own even when routine
+                // admissions are being sampled away.
+                let severity = if cost_usd > 0.001 { Severity::Notice } else { Severity::Info };
+                let message = audit::say::admitted(
+                    &name, reuse[1], cost_usd, regen.cpu_ms, regen.gpu_ms, regen.db_ms,
+                    regen.api_cost_usd, density, threshold, evicted,
+                );
+                self.audit.record(
+                    self.now_ms, AuditKind::Admit, severity, name, &ctx.application,
+                    message, facts, cost_usd,
+                );
+            }
+            Action::Reject => {
+                // Refusing something that turns out to be expensive is the decision most
+                // worth reviewing, so it is never sampled away.
+                let severity = if cost_usd > 0.001 { Severity::Notice } else { Severity::Info };
+                let message = audit::say::rejected(
+                    &name, decision.reason_code, ctx.size_bytes, reuse[1], density, threshold,
+                );
+                self.audit.record(
+                    self.now_ms, AuditKind::Reject, severity, name, &ctx.application,
+                    message, facts, -cost_usd,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Record a capacity decision in words, including the decision *not* to scale — which
+    /// is the one a reader is most likely to doubt.
+    pub fn audit_capacity(
+        &mut self,
+        from: u64,
+        to: u64,
+        delta_hit: f64,
+        savings_hr: f64,
+        rent_hr: f64,
+        roi: f64,
+        threshold: f64,
+    ) {
+        let (kind, message) = if to == from {
+            (AuditKind::ScaleHold, audit::say::held(from, to, roi, threshold))
+        } else if to > from {
+            (AuditKind::ScaleUp, audit::say::scaled(from, to, delta_hit, savings_hr, rent_hr))
+        } else {
+            (AuditKind::ScaleDown, audit::say::scaled(from, to, delta_hit, savings_hr, rent_hr))
+        };
+        let facts = vec![
+            Fact::new("from", audit::bytes(from)),
+            Fact::new("to", audit::bytes(to)),
+            Fact::new("delta_hit_rate", format!("{:.1} points", delta_hit * 100.0)),
+            Fact::new("savings", audit::usd_per_hour(savings_hr)),
+            Fact::new("rent", audit::usd_per_hour(rent_hr)),
+            Fact::new("roi", format!("{roi:.2}x")),
+        ];
+        let severity = if kind == AuditKind::ScaleHold { Severity::Info } else { Severity::Notice };
+        self.audit.record(
+            self.now_ms, kind, severity, "capacity", "engine", message, facts,
+            savings_hr - rent_hr,
+        );
+    }
+
+    pub fn audit_regime(&mut self, from: &str, to: &str, confidence: f64) {
+        let message = audit::say::regime_changed(from, to, confidence);
+        self.audit.record(
+            self.now_ms, AuditKind::RegimeChange, Severity::Notice, to, "engine", message,
+            vec![Fact::new("confidence", audit::percent(confidence))], 0.0,
+        );
+    }
+
+    pub fn audit_model(&mut self, name: &str, features: usize, source: &str, auc: Option<f64>) {
+        let message = audit::say::model_loaded(name, features, source, auc);
+        self.audit.record(
+            self.now_ms, AuditKind::ModelLoad, Severity::Notice, name, "engine", message,
+            vec![Fact::new("features", features.to_string()), Fact::new("source", source)], 0.0,
+        );
     }
 
     pub fn explain_key(&self, key: KeyId) -> Option<&ExplainRecord> {
