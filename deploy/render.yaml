@@ -1,11 +1,13 @@
-# Render blueprint. Three services from one repository, each built from its own Dockerfile
-# with the repository root as context.
+# Render blueprint: the cache and its console.
 #
-# Render sets PORT and routes to nothing else, which is why the engine and the applications
-# read it rather than hardcoding 8080/8101/8102.
+# The two example applications are deliberately not here. They run on your laptop against
+# the public engine URL, which keeps the hosted surface to two services and lets you start
+# and stop traffic during a demo. Their service definitions are at the bottom, commented,
+# for when that changes.
 #
-# Secrets are marked sync:false so they are never written into the repository; set them once
-# in the Render dashboard and they persist across deploys.
+# Render sets PORT and routes to nothing else, which is why the engine reads it rather than
+# hardcoding 8080. Secrets marked sync:false are set once in the dashboard and never appear
+# in the repository.
 
 services:
   - type: web
@@ -13,58 +15,90 @@ services:
     runtime: docker
     dockerfilePath: ./deploy/Dockerfile.engine
     dockerContext: .
-    plan: starter          # 512 MB. Keep the pool at 128 MB; --real-values holds real bytes.
+    plan: starter
     healthCheckPath: /healthz
     envVars:
       - key: RUST_LOG
         value: info
+
+      # 64 MB of payload on a 512 MB instance. --real-values holds real bytes and the
+      # measured overhead is about 1.5x, so this is roughly 100 MB resident before the
+      # engine's own structures. The host-memory clamp will lower it further if the
+      # instance has less free than that; it will not raise it.
       - key: AURA__CACHE__CAPACITY_BYTES
-        value: "134217728"
+        value: "67108864"
       - key: AURA__CAPACITY__HOST_BUDGET_BYTES
-        value: "402653184"
+        value: "134217728"
       - key: AURA__CAPACITY__AUTO
         value: "true"
       - key: AURA__PREDICTOR__KIND
         value: gbdt
+      - key: AURA__PREDICTOR__SUPABASE_AUTOLOAD
+        value: "true"
+
+      # Anything with a public address runs enforced. Without SUPABASE_JWT_KEY the engine
+      # refuses to start in this mode rather than accepting everyone.
+      - key: AURA_AUTH
+        value: enforced
+      - key: SUPABASE_JWT_KEY
+        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_SECRET_KEY
         sync: false
 
   - type: web
-    name: aura-recommendation
-    runtime: docker
-    dockerfilePath: ./deploy/Dockerfile.apps
-    dockerContext: .
-    plan: starter
-    dockerCommand: python -m recommendation.main
-    healthCheckPath: /health
+    name: aura-console
+    runtime: static
+    rootDir: frontend/universe
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
     envVars:
-      # Paste the engine's internal address here after its first deploy, in the form
-      # http://aura-engine:<port Render assigned>. Internal traffic does not leave Render,
-      # so the cache stays off the public internet even though the engine is a web service.
-      - key: AURA_APPS_AURA_BASE_URL
+      # Baked into the bundle at build time, so changing one means a redeploy.
+      - key: VITE_AURA_URL
+        sync: false          # https://aura-engine-xxxx.onrender.com
+      - key: VITE_SUPABASE_URL
         sync: false
-      - key: LOG_LEVEL
-        value: INFO
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+    routes:
+      # Single-page app: every path falls through to the one HTML file, or a refresh on any
+      # panel returns 404.
+      - type: rewrite
+        source: /*
+        destination: /index.html
 
-  - type: web
-    name: aura-analytics
-    runtime: docker
-    dockerfilePath: ./deploy/Dockerfile.apps
-    dockerContext: .
-    plan: starter
-    dockerCommand: python -m analytics.main
-    healthCheckPath: /health
-    envVars:
-      # Paste the engine's internal address here after its first deploy, in the form
-      # http://aura-engine:<port Render assigned>. Internal traffic does not leave Render,
-      # so the cache stays off the public internet even though the engine is a web service.
-      - key: AURA_APPS_AURA_BASE_URL
-        sync: false
-      # Render has no IPv6 route out, so the direct Supabase host is unreachable from here.
-      # Set the transaction pooler DSN (port 6543) and nothing else.
-      - key: SUPABASE_TRANSACTION_URL
-        sync: false
-      - key: LOG_LEVEL
-        value: INFO
+# ---------------------------------------------------------------------------
+# The applications, for when they should be hosted rather than run locally.
+# Each needs AURA_APPS_AURA_BASE_URL pointing at the engine's internal address and its own
+# AURA_API_KEY minted from the console. Analytics needs SUPABASE_TRANSACTION_URL, not the
+# direct one: Render containers have no IPv6 route and the direct Supabase host is IPv6
+# only.
+#
+#  - type: web
+#    name: aura-recommendation
+#    runtime: docker
+#    dockerfilePath: ./deploy/Dockerfile.apps
+#    dockerContext: .
+#    dockerCommand: python -m recommendation.main
+#    healthCheckPath: /health
+#    envVars:
+#      - key: AURA_APPS_AURA_BASE_URL
+#        sync: false
+#      - key: AURA_API_KEY
+#        sync: false
+#
+#  - type: web
+#    name: aura-analytics
+#    runtime: docker
+#    dockerfilePath: ./deploy/Dockerfile.apps
+#    dockerContext: .
+#    dockerCommand: python -m analytics.main
+#    healthCheckPath: /health
+#    envVars:
+#      - key: AURA_APPS_AURA_BASE_URL
+#        sync: false
+#      - key: AURA_API_KEY
+#        sync: false
+#      - key: SUPABASE_TRANSACTION_URL
+#        sync: false
