@@ -62,11 +62,24 @@ information the cache ever sees — it never knows what a "recommendation" is.
   "size_bytes": 1854200,
   "ttl_ms": 300000,
   "sla_class": "high",
-  "regen": { "cpu_ms": 320.0, "db_ms": 140.0, "gpu_ms": 80.0, "api_cost_usd": 0.002 }
+  "regen": { "cpu_ms": 320.0, "db_ms": 140.0, "gpu_ms": 80.0, "api_cost_usd": 0.002 },
+  "depends_on": ["row:user:1842", "table:catalog"],
+  "namespace": "recommendation"
 }
 ```
 
 `sla_class` ∈ `"critical" | "high" | "normal" | "low"`.
+
+`depends_on` is what the object was derived from, as free-form tags the application chooses.
+The cache never interprets a tag — `row:product:42` and `tenant:acme` are the same kind of
+thing to it. It only records the edge, so that when the application says "this row changed"
+it can name every object downstream of it without knowing what any of them are. Without
+this the only way to stay correct after a write is a short TTL, which pays for staleness on
+every object all the time instead of paying for accuracy once, when something actually
+changes.
+
+`namespace` is the generation the object belongs to. Optional; only needed if you intend to
+retire a whole class of objects at once (see `POST /v1/version/bump`).
 
 ### 1.3 `Decision`
 ```json
@@ -83,20 +96,38 @@ Base URL `http://localhost:8080`. All responses `Cache-Control: no-store`.
 
 ```
 GET    /v1/cache/{key}?application=analytics
-       200 -> { "hit": true,  "value": <base64|json>, "age_ms": 812, "layer": "L2", "latency_us": 41 }
-       404 -> { "hit": false, "reason": "miss" }
+       200 -> { "hit": true,  "value": <base64|json>, "age_ms": 812, "stale": false,
+                "layer": "L2", "latency_us": 41 }
+       404 -> { "hit": false, "reason": "miss",
+                "rebuild": true, "retry_after_ms": 0, "lease_ms": 5000 }
 
 PUT    /v1/cache/{key}
-       body: { "value": <any>, "context": ObjectContext }
+       body: { "value": <any>, "context": ObjectContext, "measured": CostVector? }
        200 -> { "admitted": true, "reason_code": "density_above_threshold",
-                "evicted": ["media:41", "media:99"], "used_bytes": 402653184 }
+                "evicted": ["media:41", "media:99"], "tags": ["row:product:1292"],
+                "namespace_version": 7, "used_bytes": 402653184 }
 
 DELETE /v1/cache/{key}                       -> { "removed": true }
-POST   /v1/cache/{key}/refresh               -> { "queued": true }
+POST   /v1/cache/{key}/refresh
+       body: { "value": <any> }?             -> { "rebuilt": true, "value_replaced": true, "note": … }
 POST   /v1/cache/batch/get  { "keys": [...] } -> { "results": { key: {...} } }
 ```
 
 `GET` is the hot path: no model inference runs on it.
+
+**`stale`** means the object is past its soft threshold and is being served once while a
+rebuild is owed. The caller may use it or go to the origin; the cache does not decide that
+for them.
+
+**`rebuild`** is the single-flight lease. On a miss exactly one caller is told `true` and is
+expected to build the object and `PUT` it; everyone else gets `false` with a
+`retry_after_ms`. This is what turns a thousand simultaneous misses on one hot key into one
+origin call. A `PUT` or `DELETE` on the key releases the lease early; otherwise it expires
+after `lease_ms` so a caller that died cannot wedge the key.
+
+**`/refresh` without a `value` does not refresh anything.** It charges the rebuild and says
+so in `note`. Moving the clock without replacing the bytes turns a stale object into a
+permanently fresh-looking stale object, which is worse than leaving it alone.
 
 ### 2.2 Explainability
 
@@ -119,6 +150,53 @@ GET /v1/explain/{key}
 
 GET /v1/explain/recent?limit=50   -> { "decisions": [ ExplainRecord, … ] }
 ```
+
+### 2.2b Correctness plane
+
+```
+POST /v1/invalidate
+     body: { "tags": ["row:product:1292"], "mode": "hard" | "soft", "source": "postgres" }
+     200 -> { "tags": [...], "mode": "hard", "matched": 3,
+              "keys_hard": 3, "keys_soft": 0 }
+     400 -> { "error": "no tags given; invalidation needs something to match" }
+
+POST /v1/version/bump
+     body: { "namespace": "recommendation" }
+     200 -> { "namespace": "recommendation", "version": 8 }
+
+GET  /v1/consistency
+     200 -> { "tracked_keys": 18422, "tracked_tags": 9310,
+              "namespaces": { "recommendation": 8 },
+              "invalidations": 41, "keys_invalidated": 903, "soft_invalidations": 122,
+              "version_bumps": 2, "stale_serves": 76, "expired": 12044, "evicted": 88301,
+              "refresh_backlog": 6,
+              "single_flight": { "leases_granted": 20114,
+                                 "origin_calls_suppressed": 6602,
+                                 "leases_held": 3 },
+              "recent": [ InvalidationEvent, … ] }
+
+GET  /v1/refresh/queue?limit=50
+     200 -> { "count": 6, "pending": 6, "items": [
+                { "key": "8123", "application": "analytics", "object_type": "rollup",
+                  "size_bytes": 41200, "ttl_ms": 60000, "ttl_remaining_frac": 0.07,
+                  "last_regen": CostVector } ] }
+```
+
+`mode` is the whole decision. **Hard** removes immediately and is correct for anything where
+being wrong is unacceptable — a price, a permission, a balance. **Soft** marks stale, so the
+next reader gets the old value once while a rebuild runs behind them; correct for derived,
+tolerant data such as a rollup or a recommendation list, where one slightly stale answer is
+far cheaper than a stampede.
+
+A **version bump deletes nothing**. New requests carry the new version, miss cleanly, and
+the old generation ages out under ordinary eviction pressure. This is how a model redeploy
+is handled: flushing instead would empty a large part of the cache at once and send the
+whole miss stream at the origin.
+
+`/v1/refresh/queue` is the plug-and-play half of refresh. The engine knows *which* objects
+are about to go bad and what they cost; only the application knows how to build one. So the
+engine publishes the backlog and the application rebuilds and `PUT`s. Nothing in the engine
+ever calls an application endpoint.
 
 ### 2.3 Introspection / control
 

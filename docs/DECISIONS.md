@@ -76,6 +76,10 @@ Do not relitigate these without changing this file first.
 | D31 | Single engine replica until consistent hashing exists | Two replicas mean two independent pools and every benchmark number becomes meaningless. |
 | D32 | No LLM anywhere in the decision path | Optional narration of structured reasons only. |
 | D33 | One owner per directory | Two sessions writing the same tree have already overwritten each other once. |
+| D34 | **Validity is checked before value** on every read, and the freshness check consults neither the model nor the economics | A cache that serves ₹40 after the database says ₹20 is not fast, it is wrong. No score is high enough to buy a wrong answer. |
+| D35 | A refresh **rebuilds through the origin and is charged to the backend ledger** | Refreshing ahead of expiry is cheaper than an expiry storm, but it is not free. A controller told it was free would refresh everything, constantly. |
+| D36 | Single-flight is a **lease handed to the caller**, not a rebuild the cache performs | Only the application knows how to build an object. The cache can still say who is allowed to, which is what turns a thousand simultaneous misses into one origin call. |
+| D37 | Baselines run their **real implementations**, never a shared `rank()` function | W-TinyLFU, S3-FIFO and SIEVE are defined by their structure, not by a scoring expression. Beating a four-tuple caricature of them proves nothing. |
 
 ---
 
@@ -132,30 +136,34 @@ Do not relitigate these without changing this file first.
 
 ## 3. What is real right now
 
-Verified by reading the source at commit `a19e7d5`, not by reading documentation.
+Verified by reading the source at commit `c9d0268`, not by reading documentation.
+42 tests pass in `aura-server`, 95 across the workspace.
 
 | Component | State | Note |
 |---|---|---|
 | Decision engine, admission, eviction, scoring | Real | 3.2 µs p50 on the write path, zero on reads |
-| Nine baseline policies | Real | LRU, FIFO, LFU, GDSF, W-TinyLFU, S3-FIFO, SIEVE, LeCaR, Belady |
+| Nine baseline policies | Real | LRU, FIFO, LFU, GDS, GDSF, W-TinyLFU, S3-FIFO, SIEVE, LeCaR, plus Belady as the ceiling |
+| Benchmark harness | Real | Drives the real policy implementations (D37), one identical stream, metadata overhead charged per policy |
 | Cost vector and economic model | Real | Measured by the application, not estimated |
-| Thompson mixture with decay | Real | But rewarded at decision time — see B1 |
-| Capacity controller | Real economics | Moves real memory only behind `--real-values` |
+| Thompson mixture with decay | Real | Rewarded from the 60-second outcome, not from the decision |
+| Delayed feedback loop | Real | `feedback.rs` wired: settle at 60 s, retire at 600 s, online model corrected from realised labels |
+| Trained model | Real | LightGBM on 397,616 rows. AUC 0.9396 / 0.9251 / 0.8836, ECE 0.0123 / 0.0145 / 0.0491 |
+| Feature projection | Real | Bundle feature names resolved to engine indices; an unknown name is refused, never silently dropped |
+| Consistency | Real | Dependency tags, namespace versions, soft/hard TTL, three distinct removal reasons — wired into `get`, `put` and every removal path |
+| Refresh | Real | Rebuilds through the origin and pays for it (D35). No longer resets the clock on bytes nobody rebuilt |
+| Single-flight | Real | Lease on the miss path (D36); `origin_calls_suppressed` counted |
+| Audit log | Real | Every writer wired, sentences with the numbers behind them, correctness events never sampled away, shipped to Supabase with re-queue on failure |
+| Capacity controller | Real economics | Explains the ROI arithmetic in words, including the decision *not* to spend |
 | Ghost cache / miss-ratio curve | Real | 1% spatial sample |
 | Feature builder | Real | Parity-tested against the Python trainer |
-| HTTP + WebSocket surface | Real | 26 of 26 contract routes |
-| Benchmark harness | Real | Same stream to every policy, Belady bound |
-| Supabase control plane | Real | Off the request path |
-| Dashboard | Real | JSX, GSAP, live telemetry |
-| **Traffic** | **Synthetic** | The engine's own generator |
-| **Trained model** | **None** | `engine/models/` does not exist |
-| **Online learning** | **Not wired** | `observe()` never called |
-| **Refresh** | **Broken** | Resets the timestamp, does not rebuild |
-| **Invalidation** | **Missing** | TTL only |
-| **L1** | **Not a cache** | An admission window holding keys, no values |
-| **Deployment** | **Missing** | `deploy/` is empty |
-
----
+| HTTP + WebSocket surface | Real | 30 routes; `/v1/invalidate`, `/v1/version/bump`, `/v1/consistency`, `/v1/refresh/queue` added |
+| Supabase control plane | Real | Off the request path: model registry, benchmark results, events, audit log |
+| Deployment | Real | Docker Compose, three images, Railway config |
+| Dashboard | Partial | JSX, GSAP, live telemetry — but nothing yet renders the `consistency` block or the single-flight counters |
+| **Traffic** | **Synthetic** | The engine's own generator. The two applications exist but do not yet drive the demo |
+| **Timing under load** | **Not honest** | `take()` ignores `rps()`, so an offline flash crowd changes which keys arrive, not how many. p95 is isolated rebuild cost, not latency under concurrency |
+| **L1** | **Real in the SDK** | `apps/common/l1.py`; the engine's own L1 is still an admission window holding keys, not values |
+| **Multi-node** | **Missing** | Single replica by decision (D31) until consistent hashing exists |
 
 ## 4. Task board
 
@@ -165,49 +173,50 @@ Status values: `todo`, `doing`, `blocked`, `done`. Owner is a person or a sessio
 
 | ID | Task | Owner | Status | Notes |
 |---|---|---|---|---|
-| B1 | Delayed feedback: decision journal, realised bandit reward, online predictor labels | engine | **doing** | `feedback.rs` written with tests. Needs wiring into `engine.rs` and a settle call on the controller tick. |
-| B2 | Consistency: dependency tags, namespace versions, soft/hard TTL, three removal reasons | engine | **doing** | `consistency.rs` written with tests. Needs `depends_on` on PUT, `/v1/invalidate`, `/v1/version/bump`. |
-| B3 | Real refresh — call the origin and replace the value | engine | todo | Depends on B2's stale marking and an SDK rebuild endpoint. |
-| B4 | Train and publish a bundle with the 12 portable features (D8) | training | todo | Must land after D8 is implemented, or the bundle is thrown away. |
+| B1 | Delayed feedback: decision journal, realised bandit reward, online predictor labels | engine | **done** | Wired in `engine.rs`; `settle_feedback` runs on the controller tick. |
+| B2 | Consistency: dependency tags, namespace versions, soft/hard TTL, three removal reasons | engine | **done** | `depends_on` on PUT, `/v1/invalidate`, `/v1/version/bump`, `/v1/consistency`. Freshness checked before value. |
+| B3 | Real refresh — call the origin and replace the value | engine | **done** | `Engine::rebuild` charges the backend ledger; `/v1/refresh/queue` publishes the backlog for the application to rebuild. |
+| B4 | Train and publish a bundle with the portable features (D8) | training | **done** | Three GBDT bundles in `engine/models/` and in Supabase. `reuse_linear_h60s` in Supabase is a stale export and is refused at load — delete or re-export it. |
 
 ### Evidence — turns mechanisms into proof
 
 | ID | Task | Owner | Status | Notes |
 |---|---|---|---|---|
 | E1 | Drive the demo from the two applications instead of the generator | apps | todo | Configuration, not code. Removes "traffic generated by the cache itself". |
-| E2 | User simulator: sessions, clicks, purchases, real concurrency | apps | todo | 40k users is a *population*, not a request rate. Target ~200–500 rps. |
-| E3 | Honest timing: Poisson arrivals respecting `rps()`, bounded worker pool, windowed metrics | engine | todo | Three defects, one fix. `take()` currently ignores spikes entirely. |
+| E2 | User simulator: sessions, clicks, purchases, real concurrency | apps | **doing** | Population and driver exist and have issued 5,269 real HTTP requests at 263 rps. Not yet the demo's traffic source. |
+| E3 | Honest timing: Poisson arrivals respecting `rps()`, bounded worker pool, windowed metrics | engine | todo | Three defects, one fix. The offline harness still ignores spikes entirely. |
 | E4 | Per-application policy mixture on screen | dashboard | todo | The experiment that proves adaptation. |
 | E5 | Allocation-over-time chart | dashboard | todo | The frame already carries `capacity`. |
-| E6 | Benchmark against S3-FIFO, SIEVE, W-TinyLFU | engine | todo | All three already exist in `aura-core` and the harness does not run them. |
+| E6 | Benchmark against S3-FIFO, SIEVE, W-TinyLFU | engine | **done** | All nine run by default, through their real implementations (D37). |
+| E7 | Consistency and single-flight panels | dashboard | todo | The frame carries `consistency` including `origin_calls_suppressed`; nothing renders it. |
 
 ### Correctness and scale
 
 | ID | Task | Owner | Status | Notes |
 |---|---|---|---|---|
-| C1 | Single-flight on the read path | engine | todo | Without it our own invalidation is an attack on the origin. |
-| C2 | Postgres trigger + listener → `/v1/invalidate` | db | todo | Answers the ₹40 → ₹20 case for writes that never touch our code. |
+| C1 | Single-flight on the read path | engine | **done** | Lease returned on a miss (D36). |
+| C2 | Postgres trigger + listener → `/v1/invalidate` | db | **doing** | `005_consistency.sql` and `apps/invalidator/listener.py` exist; the endpoint they call now exists too. Needs an end-to-end run. |
 | C3 | Epoch-versioned personalised keys + deliberate bypass | apps | todo | D24, D25. |
-| C4 | Real in-process L1 in the SDK; rename the admission window | apps | todo | It reports as a cache tier and stores nothing. |
+| C4 | Real in-process L1 in the SDK; rename the admission window | apps | **doing** | `apps/common/l1.py` is real with 16 tests. The engine's own L1 is still misnamed. |
 | C5 | Per-application memory floors and reallocation | engine | todo | The "move the boundary instead of buying" story is in the pitch, not the code. |
 | C6 | `--real-values` by default | engine | todo | D30. Half an hour. |
 | C7 | Multi-node: consistent hashing, `ScaleOut` | engine | todo | Only after single node is honest. |
+| C8 | Durable audit log | engine | **done** | `006_audit_log.sql`, batched shipper, re-queue on failure. |
 
 ### Shipping
 
 | ID | Task | Owner | Status | Notes |
 |---|---|---|---|---|
-| S1 | Docker Compose | deploy | todo | Multi-stage Rust image, one Python image, static dashboard. |
-| S2 | Railway | deploy | todo | Single engine replica (D31), `Cache-Control: no-store`, no persistent disk. |
-| S3 | Trace emitter | engine | todo | Partly solved by B1 — the journal retires labelled rows already. |
+| S1 | Docker Compose | deploy | **done** | Three images, `mem_limit` set so the pool is a real constraint. |
+| S2 | Railway | deploy | **done** | `railway.json`; single replica (D31), `Cache-Control: no-store`. |
+| S3 | Trace emitter | engine | **done** | The journal retires labelled rows; `/v1/training/rows` drains them. |
 
 ---
 
 ## 5. Open questions
 
-1. **Problem statement text.** Still not seen. Judging criteria may reorder §4.
-2. **Deadline.** Unknown. Determines how far down §4 we get.
-3. **Team split.** D33 says one owner per directory; the owners are not assigned.
+1. **Which scenarios we actually win.** The benchmark now runs the real baselines rather than caricatures of them, so the margin will be smaller and the ranking may change. The brief requires beating conventional caching on at least three scenarios; until those five tables are read, that claim is unproven.
+2. **Team split.** D33 says one owner per directory; the owners are not assigned.
 4. **Host memory.** `host_budget_bytes` is a config constant, not a reading of real free RAM. Decide whether to read the OS or to keep it declarative and say so.
 5. **Benchmark honesty.** `take()` in the offline harness ignores the spike function, so flash crowds change only which keys are requested, not the load. Fix in E3 or stop calling that scenario a flash crowd.
 
@@ -218,3 +227,4 @@ Status values: `todo`, `doing`, `blocked`, `done`. Owner is a person or a sessio
 | Date | Change |
 |---|---|
 | 2026-09-04 | Document created. D1–D33 recorded. `feedback.rs` and `consistency.rs` added for B1/B2. D8 supersedes the 16-feature vector in `CONTRACTS.md` §5. |
+| 2026-09-04 | B1–B4, C1, C8, E6, S1–S3 closed. D34–D37 recorded. Consistency wired into the read path; refresh rebuilds instead of resetting the clock; the benchmark drives the real policy implementations. §3 rewritten against commit `c9d0268`. |
