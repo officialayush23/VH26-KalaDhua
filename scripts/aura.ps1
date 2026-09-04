@@ -137,14 +137,21 @@ function Invoke-AuraReload {
 # ----------------------------------------------------------------- explanations
 
 function Get-AuraAudit {
-    <# Recent decisions, each as a sentence with the numbers that produced it. #>
+    <#
+        Recent decisions, each as a sentence with the numbers that produced it.
+
+        -Kind filters server-side: admit, reject, evict, refresh, expire, invalidate,
+        version_bump, scale_up, scale_down, scale_hold, policy_shift, model_load,
+        regime_change, pressure.
+    #>
     param([int]$Limit = 20, [string]$Kind, [switch]$Raw)
-    $result = Invoke-Aura -Path "/v1/audit?limit=$Limit"
+    $path = "/v1/audit?limit=$Limit"
+    if ($Kind) { $path += "&kind=$Kind" }
+    $result = Invoke-Aura -Path $path
     if ($null -eq $result) { return }
     if ($Raw) { return $result }
 
     $entries = $result.entries
-    if ($Kind) { $entries = $entries | Where-Object { $_.kind -eq $Kind } }
 
     foreach ($e in $entries) {
         $colour = switch ($e.severity) {
@@ -329,7 +336,8 @@ function Show-Aura {
 
     $stats = Get-AuraStats
     if ($null -ne $stats) {
-        Write-Host ("  requests    {0:N0}" -f $stats.engine.admissions)
+        Write-Host ("  requests    {0:N0} served, {1:N0} admitted, {2:N0} evicted" -f `
+            $stats.engine.requests, $stats.engine.admissions, $stats.engine.evictions)
     }
     $policy = Get-AuraPolicy
     if ($null -ne $policy) {
@@ -341,9 +349,16 @@ function Show-Aura {
     }
     $fb = Get-AuraFeedback
     if ($null -ne $fb) {
-        Write-Host ("  calibration predicted {0:P0} vs realised {1:P0}   error {2:P1}" -f `
-            $fb.mean_predicted, $fb.mean_realised, [math]::Abs($fb.calibration_error))
-        Write-Host ("  judged      {0:N0} decisions settled, {1:N0} still pending" -f $fb.settled, $fb.pending)
+        # Split, because one calibration number hides the asymmetry: being over-confident
+        # about what we kept wastes memory, about what we refused forces rebuilds.
+        Write-Host ("  kept        predicted {0:P0} vs realised {1:P0}   error {2:P1}  over {3:N0} decisions" -f `
+            $fb.calibration.kept.predicted, $fb.calibration.kept.realised,
+            [math]::Abs($fb.calibration.kept.error), $fb.calibration.kept.decisions)
+        Write-Host ("  refused     predicted {0:P0} vs realised {1:P0}   error {2:P1}  over {3:N0} decisions" -f `
+            $fb.calibration.refused.predicted, $fb.calibration.refused.realised,
+            [math]::Abs($fb.calibration.refused.error), $fb.calibration.refused.decisions)
+        Write-Host ("  judged      {0:N0} settled, {1:N0} pending, {2:N0} training rows ready" -f `
+            $fb.overall.settled, $fb.overall.pending, $fb.rows_ready)
     }
     $c = Get-AuraConsistency
     if ($null -ne $c) {

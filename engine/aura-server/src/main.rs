@@ -891,15 +891,35 @@ fn default_limit() -> usize {
 /// `/v1/explain/{key}` answers "why this object" for a question you already knew to ask.
 /// This is the log you read when you do not: every decision that cost money or touched
 /// correctness, written as prose with the numbers that produced it.
-async fn audit_log(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+async fn audit_log(State(app): State<Shared>, Query(q): Query<AuditQuery>) -> impl IntoResponse {
     let eng = app.engine.lock();
-    let entries = eng.audit.recent(q.limit.min(500));
+    let limit = q.limit.min(500);
+    // Filtering by kind server-side matters for the dashboard: an operator chasing a
+    // correctness problem wants the invalidations, and pulling five hundred admissions to
+    // find three of them is the wrong shape of request.
+    let entries = match q.kind.as_deref() {
+        Some(k) => eng.audit.recent_of(k, limit),
+        None => eng.audit.recent(limit),
+    };
     Json(json!({
         "entries": entries,
         "count": entries.len(),
+        "held": eng.audit.len(),
+        "empty": eng.audit.is_empty(),
         "suppressed_routine": eng.audit.suppressed,
         "pending_shipment": eng.audit.pending_shipment(),
     }))
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    /// One of the AuditKind names: admit, reject, evict, refresh, expire, invalidate,
+    /// version_bump, scale_up, scale_down, scale_hold, policy_shift, model_load,
+    /// regime_change, pressure.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 /// Drain matured decisions as labelled training rows.
@@ -929,7 +949,26 @@ async fn training_rows(State(app): State<Shared>, Query(q): Query<LimitQuery>) -
 /// back 0.42, it is confidently wrong and the confidence floor is the only thing keeping
 /// the cache sane.
 async fn feedback_stats(State(app): State<Shared>) -> impl IntoResponse {
-    Json(serde_json::to_value(app.engine.lock().journal_stats()).unwrap_or(Value::Null))
+    let eng = app.engine.lock();
+    let stats = serde_json::to_value(eng.journal_stats()).unwrap_or(Value::Null);
+    let (kept, refused) = (eng.calib_kept, eng.calib_refused);
+    Json(json!({
+        "overall": stats,
+        // Split, because one number hides the asymmetry: over-confidence about what we
+        // kept wastes memory, over-confidence about what we refused forces rebuilds.
+        "calibration": {
+            "kept":    { "predicted": round4(kept.mean_predicted()),
+                         "realised":  round4(kept.mean_realised()),
+                         "error":     round4(kept.error()),
+                         "decisions": kept.n },
+            "refused": { "predicted": round4(refused.mean_predicted()),
+                         "realised":  round4(refused.mean_realised()),
+                         "error":     round4(refused.error()),
+                         "decisions": refused.n }
+        },
+        "rows_ready": eng.journal.completed_len(),
+        "in_flight": eng.journal.in_flight(eng.now_ms, 20)
+    }))
 }
 
 async fn explain_recent(State(app): State<Shared>, Query(q): Query<LimitQuery>) -> Json<Value> {
@@ -942,7 +981,20 @@ async fn explain_key(State(app): State<Shared>, Path(key): Path<String>) -> impl
     let eng = app.engine.lock();
     let id = key_id(&key);
     match eng.explain_key(id) {
-        Some(r) => (StatusCode::OK, Json(json!(r))),
+        Some(r) => {
+            let mut body = json!(r);
+            // Correctness alongside the economics: the reasons say why the cache wants to
+            // keep this object, and this says what would make it wrong to.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "depends_on".into(),
+                    json!(eng.consistency.tags_of(id).map(|t| t.to_vec()).unwrap_or_default()),
+                );
+                obj.insert("stale".into(), json!(eng.consistency.is_stale(id)));
+                obj.insert("resident".into(), json!(eng.store.contains(id)));
+            }
+            (StatusCode::OK, Json(body))
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({ "present": false, "key": key })),

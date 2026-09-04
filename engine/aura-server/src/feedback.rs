@@ -118,6 +118,23 @@ pub struct Settled {
     pub admitted: bool,
 }
 
+/// One decision still waiting for its verdict, as the dashboard shows it.
+///
+/// The point of publishing these is that a cache which claims to learn should be able to
+/// show you what it is currently unsure about, not only what it has already been graded on.
+#[derive(Debug, Clone, Serialize)]
+pub struct InFlight {
+    pub id: u64,
+    pub key: KeyId,
+    pub application: String,
+    pub admitted: bool,
+    pub predicted_h60s: f64,
+    pub value_density: f64,
+    pub threshold: f64,
+    pub size_bytes: u64,
+    pub waiting_ms: f64,
+}
+
 /// A fully matured record, ready to become a training row.
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainingRow {
@@ -387,6 +404,32 @@ impl Journal {
     pub fn drain_completed(&mut self, n: usize) -> Vec<TrainingRow> {
         let take = n.min(self.completed.len());
         self.completed.drain(..take).collect()
+    }
+
+    /// The most recent decisions still awaiting judgement, newest first.
+    pub fn in_flight(&self, now_ms: f64, limit: usize) -> Vec<InFlight> {
+        // `pending` is a map, so there is no cheap "most recent" end to read from; the
+        // decisions have to be ordered explicitly.
+        let mut recent: Vec<&PendingDecision> =
+            self.pending.values().filter(|d| !d.settled).collect();
+        recent.sort_by(|a, b| {
+            b.decided_ms.partial_cmp(&a.decided_ms).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        recent
+            .into_iter()
+            .take(limit)
+            .map(|d| InFlight {
+                id: d.id,
+                key: d.key,
+                application: d.application.clone(),
+                admitted: d.admitted,
+                predicted_h60s: (d.predicted[1] * 10_000.0).round() / 10_000.0,
+                value_density: (d.value_density * 100.0).round() / 100.0,
+                threshold: (d.threshold * 100.0).round() / 100.0,
+                size_bytes: d.size_bytes,
+                waiting_ms: (now_ms - d.decided_ms).max(0.0),
+            })
+            .collect()
     }
 
     pub fn completed_len(&self) -> usize {

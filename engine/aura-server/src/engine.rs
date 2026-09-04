@@ -47,6 +47,41 @@ pub struct Contribution {
     pub weight: f64,
 }
 
+/// Predicted against realised, for one class of decision.
+///
+/// A single calibration number over every decision hides the asymmetry that matters. Being
+/// over-confident about objects the cache *kept* wastes memory; being over-confident about
+/// objects it *refused* forces rebuilds it could have avoided. Those are different failures
+/// with different costs, and averaging them together can look healthy while both are bad in
+/// opposite directions.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Calibration {
+    pub predicted: f64,
+    pub realised: f64,
+    pub n: u64,
+}
+
+impl Calibration {
+    fn observe(&mut self, predicted: f64, realised: bool) {
+        self.predicted += predicted;
+        self.realised += if realised { 1.0 } else { 0.0 };
+        self.n += 1;
+    }
+
+    pub fn mean_predicted(&self) -> f64 {
+        if self.n == 0 { 0.0 } else { self.predicted / self.n as f64 }
+    }
+
+    pub fn mean_realised(&self) -> f64 {
+        if self.n == 0 { 0.0 } else { self.realised / self.n as f64 }
+    }
+
+    /// Positive means over-optimistic.
+    pub fn error(&self) -> f64 {
+        self.mean_predicted() - self.mean_realised()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineEvent {
     pub t: f64,
@@ -62,10 +97,7 @@ pub struct AppStats {
     pub regen_ms_total: f64,
     pub regen_count: u64,
     pub regen_samples: Vec<f64>,
-    pub reuse_gaps: Vec<f64>,
     pub cost_usd: f64,
-    pub allocated_bytes: u64,
-    pub policy_credit: [f64; 6],
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -230,6 +262,9 @@ pub struct Engine {
     /// real rather than a clock reset.
     pub refresh_queue: VecDeque<KeyId>,
     pub decision_overhead_us: VecDeque<f64>,
+    /// Calibration for objects the cache kept, and for objects it refused.
+    pub calib_kept: Calibration,
+    pub calib_refused: Calibration,
     /// The policy mixture at the last audit, so a shift can be described as a change
     /// rather than a level.
     last_mixture: [f64; 6],
@@ -288,6 +323,8 @@ impl Engine {
             stale_serves: 0,
             refresh_queue: VecDeque::with_capacity(256),
             decision_overhead_us: VecDeque::with_capacity(2_048),
+            calib_kept: Calibration::default(),
+            calib_refused: Calibration::default(),
             last_mixture: [1.0 / 6.0; 6],
             last_pressure_note_ms: -1e12,
             rng: Rng::seed_from_u64(seed),
@@ -715,7 +752,18 @@ impl Engine {
             Fact::new("hits_while_resident", e.hits.to_string()),
             Fact::new("rebuild_cost", audit::usd(cost)),
             Fact::new("reason", reason.as_str()),
+            // What the cache believed when it took the object in, beside what it believed
+            // when it let it go. A wide gap is the model having been wrong, and it should
+            // be visible rather than inferred.
+            Fact::new("value_at_admission", format!("{:.2}", e.score)),
+            Fact::new("value_at_removal", format!("{density:.2}")),
         ];
+        if reason == Removal::Invalidated {
+            // Counted and forgotten above; the summary line in `invalidate` is the right
+            // granularity. Writing one entry per key would bury the event in its own
+            // consequences.
+            return;
+        }
         let (kind, severity, message) = match reason {
             Removal::Evicted => (
                 AuditKind::Evict,
@@ -735,11 +783,8 @@ impl Engine {
                     if e.hits == 1 { "" } else { "s" }
                 ),
             ),
-            Removal::Invalidated => (
-                AuditKind::Invalidate,
-                Severity::Notice,
-                format!("Dropped {name}: the data it was built from changed."),
-            ),
+            // Handled above.
+            Removal::Invalidated => return,
         };
         self.audit.record(
             self.now_ms, kind, severity, name, &e.application, message, facts, -cost,
@@ -1043,10 +1088,12 @@ impl Engine {
 
         let mut freed = 0u64;
         for k in &result.keys_hard {
-            if let Some(e) = self.store.remove(*k) {
-                freed += e.size_bytes;
-            }
-            self.refresh_queue.retain(|q| q != k);
+            let size = self.store.get(*k).map(|e| e.size_bytes).unwrap_or(0);
+            // Through drop_key, so the removal is counted as an invalidation rather than
+            // silently landing in the eviction total. Merging the two would hide the only
+            // one of them that means the cache was wrong.
+            self.drop_key(*k, Removal::Invalidated, 0.0, 0.0);
+            freed += size;
         }
         // A soft invalidation is a promise to rebuild, so the rebuild is queued rather
         // than left to whoever happens to read next.
@@ -1178,6 +1225,11 @@ impl Engine {
             // The 60-second label is the one that is both meaningful and available quickly
             // enough to steer a live cache.
             self.predictor.observe(&s.features, s.reused[1]);
+            if s.admitted {
+                self.calib_kept.observe(s.predicted[1], s.reused[1]);
+            } else {
+                self.calib_refused.observe(s.predicted[1], s.reused[1]);
+            }
         }
         // Retire fully matured records into training rows for the next model.
         self.journal.retire(self.now_ms, limit * 4);

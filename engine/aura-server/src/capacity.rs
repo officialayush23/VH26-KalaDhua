@@ -101,6 +101,12 @@ impl CapacityController {
         let roi = if cache_cost > 0.0 { savings / cache_cost } else { 0.0 };
 
         let pressure = engine.store.pressure();
+        // Two guards against shrinking on no evidence. `warm` says enough traffic has been
+        // seen to characterise the workload at all; `evictions_seen` says the pool has
+        // actually been under contention at some point, which is the only thing that makes
+        // "it is not full" mean "it is too big".
+        let warm = engine.requests >= 5_000;
+        let evictions_seen = engine.store.evictions > 0;
         let host_available = cfg
             .capacity
             .host_budget_bytes
@@ -122,10 +128,33 @@ impl CapacityController {
                 "ScaleOut".to_string(),
                 "more memory pays for itself but this host has none left".to_string(),
             )
-        } else if pressure < 0.55 && cur > cfg.capacity.min_bytes {
+        } else if pressure < 0.55 && cur > cfg.capacity.min_bytes && evictions_seen && warm {
             (
                 "ScaleDown".to_string(),
                 format!("only {:.0}% of the pool is in use; the rest is rent for nothing", pressure * 100.0),
+            )
+        } else if pressure < 0.55 && cur > cfg.capacity.min_bytes {
+            // Low pressure on a cache that has not filled yet is not evidence that memory
+            // is unwanted -- it is evidence that nothing has arrived. Shrinking here means
+            // an idle engine gives away the pool it is about to need, and then pays the
+            // whole warm-up again as misses. Wait for the cache to have been full enough to
+            // evict something before believing the number.
+            (
+                "Hold".to_string(),
+                if !warm {
+                    format!(
+                        "only {:.0}% in use, but the cache has served {} requests -- too few to \
+                         tell an idle pool from an oversized one",
+                        pressure * 100.0,
+                        engine.requests
+                    )
+                } else {
+                    format!(
+                        "only {:.0}% in use, but nothing has been evicted yet, so the working \
+                         set has never actually been squeezed",
+                        pressure * 100.0
+                    )
+                },
             )
         } else {
             (
