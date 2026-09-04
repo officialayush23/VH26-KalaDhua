@@ -217,6 +217,24 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(drive(app.clone()));
     if app.supabase.is_some() {
         tokio::spawn(ship_audit(app.clone()));
+        // A breadcrumb in the control plane saying which build came up with which pool and
+        // which fidelity flags. Without it, a benchmark row six hours later has no way to
+        // say what produced it.
+        let announce = app.clone();
+        tokio::spawn(async move {
+            let detail = json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "capacity_bytes": announce.cfg.cache.capacity_bytes,
+                "real_values": announce.real_values,
+                "real_backend": announce.probe.lock().enabled,
+                "predictor": announce.engine.lock().predictor.kind().as_str(),
+            });
+            if let Some(sb) = announce.supabase.as_ref() {
+                if let Err(e) = sb.push_event("engine_started", detail).await {
+                    tracing::warn!("startup event not recorded: {e}");
+                }
+            }
+        });
     }
 
     let cors = tower_http::cors::CorsLayer::new()
@@ -576,10 +594,12 @@ async fn cache_get(
         let mut eng = app.engine.lock();
         let found = eng.get(id, q.application.as_deref().unwrap_or("default"), now);
         let stale = eng.consistency.is_stale(id);
-        found.map(|e| (e.value, e.age_ms(now), stale))
+        // Age before value: reading `e.value` moves the payload out of the entry, and the
+        // entry cannot be asked anything afterwards.
+        found.map(|e| (e.age_ms(now), stale, e.value))
     };
     match hit {
-        Some((value, age_ms, stale)) => {
+        Some((age_ms, stale, value)) => {
             (
                 StatusCode::OK,
                 Json(json!({

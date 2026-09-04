@@ -266,8 +266,13 @@ impl Consistency {
         next
     }
 
-    pub fn versions(&self) -> &AHashMap<String, u64> {
-        &self.versions
+    /// Every namespace and the generation it is currently on.
+    ///
+    /// A `BTreeMap` rather than the internal hash map: this goes straight into telemetry,
+    /// and a dashboard that reorders its own rows every frame is unreadable. Ordering it
+    /// once here is cheaper than sorting it at every reader.
+    pub fn versions(&self) -> std::collections::BTreeMap<String, u64> {
+        self.versions.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 
     /// Freshness of a resident object, given when it was filled and its TTL.

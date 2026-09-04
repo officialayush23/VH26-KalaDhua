@@ -4,7 +4,7 @@ use aura_core::types::KeyId;
 use aura_sim::{Generator, Scenario};
 use serde::Serialize;
 
-use aura_core::policies::{self, CachePolicy, Request as PolicyRequest};
+use aura_core::policies::{self, Request as PolicyRequest};
 
 use crate::capacity::CapacityController;
 use crate::engine::Engine;
