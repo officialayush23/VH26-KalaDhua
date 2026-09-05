@@ -205,6 +205,7 @@ class Driver:
         self.log = log or EventLog(None)
         self._sem = asyncio.Semaphore(concurrency)
         self._seq = 0
+        self._first_error = ""
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -252,9 +253,25 @@ class Driver:
                     with contextlib.suppress(Exception):
                         body = resp.json()
                         if isinstance(body, dict):
-                            cache = str(body.get("cache", body.get("source", "unknown")))
+                            # `served_from` is the field the applications actually return.
+                            # Looking only for `cache`/`source` meant every request was
+                            # recorded as "unknown" and the hit rate read 0.0% for the whole
+                            # run even when the cache was answering most of them -- a
+                            # measurement bug that looked exactly like a broken cache.
+                            cache = str(
+                                body.get("served_from")
+                                or body.get("cache")
+                                or body.get("source")
+                                or "unknown"
+                            )
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"[:160]
+                if not self._first_error:
+                    self._first_error = f"{url} -> {error}"
+                    LOG.error(
+                        "first request failure (all further ones are counted, not logged): %s",
+                        self._first_error,
+                    )
 
             finished = time.monotonic()
             rec = RequestRecord(
@@ -392,7 +409,29 @@ async def main_async(args: argparse.Namespace) -> int:
         await driver.aclose()
         log.close()
 
-    print("\n" + json.dumps(driver.metrics.summary(), indent=2))
+    summary = driver.metrics.summary()
+    print("\n" + json.dumps(summary, indent=2))
+
+    # An open-loop generator will happily schedule traffic the targets cannot absorb, and
+    # the result looks like a slow cache rather than an overloaded application. Say which
+    # one it was, because the difference decides whether you tune the cache or the load.
+    late = summary["late_dispatches"]
+    if summary["sent"] and late > summary["sent"] * 0.25:
+        served = summary["rps"]
+        print(
+            f"\n{late} of {summary['sent']} requests were dispatched late. The services could "
+            f"not absorb the offered rate, so the latencies above are mostly queueing in this "
+            f"script -- not the cache.\n"
+            f"This run actually sustained about {served:.0f} req/s. Re-run with "
+            f"--rps {max(1, int(served * 0.8))} for numbers that measure the cache."
+        )
+    if driver._first_error:
+        print(f"\n{summary['errors']} request(s) failed. First: {driver._first_error}")
+    if summary["by_cache"].get("unknown", 0) == summary["completed"] and summary["completed"]:
+        print(
+            "\nEvery response was recorded as cache-state 'unknown'. The applications did "
+            "not return a served_from field, so the hit rate above is not measuring anything."
+        )
     if args.log_file:
         print(f"\nper-request log: {args.log_file}")
     return 0 if driver.metrics.errors < driver.metrics.completed * 0.05 else 1
@@ -400,9 +439,28 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Drive the AURA applications with simulated users")
-    p.add_argument("--users", type=int, default=40_000, help="population size, not a request rate")
+    p.add_argument(
+        "--users",
+        type=int,
+        default=4_000,
+        help=(
+            "population size, not a request rate. Keep it within what the services can warm: "
+            "personalised keys mean the working set is roughly one object per active user, "
+            "and a recommendation rebuild costs most of a second, so 40k users against a "
+            "single-process service never fills the cache and the hit rate stays at zero"
+        ),
+    )
     p.add_argument("--catalogue", type=int, default=50_000)
-    p.add_argument("--rps", type=float, default=300.0, help="target requests per second")
+    p.add_argument(
+        "--rps",
+        type=float,
+        default=40.0,
+        help=(
+            "target requests per second. The ceiling is set by how fast the applications "
+            "rebuild on a miss, not by this script: ask for more and the excess queues here "
+            "and shows up as latency the cache did not cause"
+        ),
+    )
     p.add_argument("--duration", type=float, default=120.0, help="seconds of traffic")
     p.add_argument("--speed", type=float, default=1.0, help="replay faster than real time")
     p.add_argument("--concurrency", type=int, default=256)

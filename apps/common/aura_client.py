@@ -762,6 +762,10 @@ class AuraClient:
             "rejected": int(counters["rejected"]),
             "cache_errors": int(counters["cache_errors"]),
             "breaker_skips": int(counters["breaker_skips"]),
+            # Reported separately from `hits`. A negative hit avoided an origin call for a
+            # key that does not exist, which is the traffic a value-scored cache is most
+            # likely to have thrown away -- worth being able to see on its own.
+            "negative_hits": int(counters["negative_hits"]),
             "breaker_state": self._breaker.state,
             "breaker_trips": self._breaker.trips,
             "avg_get_latency_ms": round(counters["get_latency_ms_total"] / get_calls, 4),

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import time
 import sys
 from typing import Any
 
@@ -42,10 +43,25 @@ def run(coro: Any) -> Any:
 
 
 def burn_cpu(iterations: int = 60_000) -> float:
-    """Do enough arithmetic that `process_time` registers a non-zero delta."""
+    """Burn CPU until `process_time` has actually moved.
+
+    A fixed iteration count is not enough. `time.process_time()` advances in whole scheduler
+    ticks -- about 15.6 ms on Windows -- so a loop that finishes inside one tick reports a
+    delta of exactly zero, and a test asserting that CPU was measured fails against a meter
+    that is working correctly. Burning until the clock ticks makes the test measure what it
+    claims to, on every platform, without pinning an iteration count to one machine's speed.
+
+    The cap keeps a pathological clock from hanging the suite: if the counter has not moved
+    after a hundred rounds, something is wrong with the platform, not with us, and the
+    assertion should fail loudly rather than spin.
+    """
     total = 0.0
-    for i in range(iterations):
-        total += (i % 7) ** 0.5
+    started = time.process_time()
+    for _ in range(100):
+        for i in range(iterations):
+            total += (i % 7) ** 0.5
+        if time.process_time() > started:
+            break
     return total
 
 
