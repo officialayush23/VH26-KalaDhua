@@ -2183,25 +2183,84 @@ async fn live_ws(State(app): State<Shared>, ws: WebSocketUpgrade) -> impl IntoRe
 }
 
 async fn live_socket(mut socket: WebSocket, app: Shared) {
+    // A socket that dies for an unnamed reason is the hardest kind of bug to chase from the
+    // outside: the browser reports 1006 for everything, and the server, saying nothing,
+    // makes it look like the network's fault. So every close names itself and carries how
+    // long the connection lived and how many frames it managed.
+    let opened = std::time::Instant::now();
+    let mut sent: u64 = 0;
+    let mut lagged: u64 = 0;
+    tracing::info!(receivers = app.tx.receiver_count() + 1, "telemetry socket opened");
+
     let mut rx = app.tx.subscribe();
-    let _ = socket
+    if socket
         .send(Message::Text(build_frame(&app).to_string()))
-        .await;
-    loop {
+        .await
+        .is_err()
+    {
+        tracing::warn!("telemetry socket closed before the first frame was written");
+        return;
+    }
+    sent += 1;
+
+    // Something has to be written even when nothing is happening, or an intermediary that
+    // reaps quiet connections will take this one down and the reason will look like ours.
+    // The engine broadcasts every 250 ms, so this only ever fires if that loop has stopped.
+    let mut keepalive = tokio::time::interval(Duration::from_secs(20));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let why = loop {
         tokio::select! {
             frame = rx.recv() => match frame {
-                Ok(text) => { if socket.send(Message::Text(text)).await.is_err() { break; } }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
+                Ok(text) => {
+                    if let Err(e) = socket.send(Message::Text(text)).await {
+                        break format!("write failed: {e}");
+                    }
+                    sent += 1;
+                }
+                // The client fell behind the broadcast buffer. Skipping to the newest frame
+                // is correct rather than merely tolerable: every frame is a complete
+                // snapshot, so the missed ones carry nothing the next one does not.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    lagged += n;
+                    continue;
+                }
+                Err(_) => break "engine stopped broadcasting".to_string(),
             },
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(t))) => handle_client_message(&app, &t),
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Err(_)) => break,
+                // Answered explicitly. Relying on the library to keep a connection alive
+                // for you is how a socket dies quietly on somebody else's proxy.
+                Some(Ok(Message::Ping(p))) => {
+                    if socket.send(Message::Pong(p)).await.is_err() {
+                        break "pong failed".to_string();
+                    }
+                }
+                Some(Ok(Message::Close(c))) => {
+                    break match c {
+                        Some(f) => format!("client closed: {} {}", f.code, f.reason),
+                        None => "client closed".to_string(),
+                    }
+                }
+                None => break "client went away".to_string(),
+                Some(Err(e)) => break format!("read failed: {e}"),
                 _ => {}
+            },
+            _ = keepalive.tick() => {
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    break "keepalive failed".to_string();
+                }
             }
         }
-    }
+    };
+
+    tracing::info!(
+        lived_s = opened.elapsed().as_secs_f64(),
+        frames = sent,
+        lagged,
+        reason = %why,
+        "telemetry socket closed"
+    );
 }
 
 fn handle_client_message(app: &Shared, text: &str) {
