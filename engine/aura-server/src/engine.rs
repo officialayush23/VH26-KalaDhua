@@ -268,9 +268,6 @@ pub struct Engine {
     /// lookup falls back to the global defaults, so an unconfigured application costs
     /// nothing extra.
     pub profiles: ProfileStore,
-    /// Bytes each application currently holds. Maintained at the two places residency
-    /// changes rather than counted on demand, because counting it means walking the pool.
-    pub resident_bytes: AHashMap<String, u64>,
     pub features: FeatureBuilder,
     /// The eight extra signals. Separate from `features` because they carry
     /// per-application distributions rather than per-key counters.
@@ -350,7 +347,6 @@ impl Engine {
             .collect();
         Self {
             profiles: ProfileStore::new(&cfg),
-            resident_bytes: AHashMap::new(),
             cfg,
             store,
             features,
@@ -639,7 +635,7 @@ impl Engine {
         // worthless one belonging to a quieter application, which is not fairness.
         let share_penalty = {
             let cap = self.store.capacity_bytes();
-            let held = *self.resident_bytes.get(&ctx.application).unwrap_or(&0);
+            let held = self.store.resident_bytes_of(&ctx.application);
             if cap > 0 && profile.max_pool_share < 1.0 {
                 let share = held as f64 / cap as f64;
                 if share > profile.max_pool_share {
@@ -677,7 +673,7 @@ impl Engine {
 
         let mut evicted = Vec::new();
         let decision = if admit {
-            evicted = self.make_room(ctx.size_bytes, value_density, now_ms);
+            evicted = self.make_room(ctx.size_bytes, value_density, now_ms, &ctx.application);
             if self.store.fits(ctx.size_bytes) {
                 self.store.insert(Entry {
                     key,
@@ -692,7 +688,6 @@ impl Engine {
                     hits: 0,
                     score: value_density,
                 });
-                *self.resident_bytes.entry(ctx.application.clone()).or_insert(0) += ctx.size_bytes;
                 self.ledger.cache_usd += self.cfg.pricing.holding_cost_usd(
                     ctx.size_bytes as f64,
                     ctx.ttl_ms.unwrap_or(60_000.0).min(600_000.0),
@@ -777,9 +772,42 @@ impl Engine {
         value / hold
     }
 
+    /// The number of bytes an application is not evicted below while any other application
+    /// is over its own share.
+    ///
+    /// Without this a scan in one application walks the whole pool and evicts every object
+    /// belonging to every other one: each individual eviction is correct on value density
+    /// (a scanned row genuinely is worth more than a cold recommendation), and the sum of
+    /// correct decisions is a cache that has forgotten an entire tenant. Value density
+    /// ranks objects; it has nothing to say about who they belong to.
+    ///
+    /// The floor is deliberately a fraction rather than the whole fair share. At the
+    /// default 0.5 with three resident applications each is guaranteed a sixth of the pool
+    /// and the other half is contested purely on merit, so an application that really is
+    /// carrying the traffic can still hold most of the cache.
+    pub fn floor_bytes(&self) -> u64 {
+        let fraction = self.cfg.engine.app_floor_fraction.clamp(0.0, 1.0);
+        if fraction <= 0.0 {
+            return 0;
+        }
+        let apps = self.store.application_count().max(1) as u64;
+        ((self.store.capacity_bytes() / apps) as f64 * fraction) as u64
+    }
+
     /// Sampled eviction. Scanning every resident object to find the true minimum is not
     /// affordable at request rate, and sampling 32 gets within a few percent of it.
-    fn make_room(&mut self, needed: u64, incoming_density: f64, now_ms: f64) -> Vec<KeyId> {
+    ///
+    /// Candidates are partitioned by whether taking them would push their application below
+    /// its floor. The weakest unprotected candidate is preferred; a protected one is taken
+    /// only when the entire sample was protected, so the floor can never turn into a refusal
+    /// to free space -- the byte budget is an invariant, fairness is a preference.
+    fn make_room(
+        &mut self,
+        needed: u64,
+        incoming_density: f64,
+        now_ms: f64,
+        incoming_app: &str,
+    ) -> Vec<KeyId> {
         let mut evicted = Vec::new();
         if self.store.fits(needed) {
             return evicted;
@@ -789,19 +817,37 @@ impl Engine {
         let mut guard = 0;
         while !self.store.fits(needed) && guard < 4_096 {
             guard += 1;
+            // Recomputed each pass: evicting changes both the residency totals and, when an
+            // application is emptied, the number of applications the share is divided among.
+            let floor = self.floor_bytes();
             let keys = self.store.keys();
             if keys.is_empty() {
                 break;
             }
             let mut worst: Option<(KeyId, f64)> = None;
+            let mut worst_protected: Option<(KeyId, f64)> = None;
             for _ in 0..sample_n.min(keys.len()) {
                 let k = keys[self.rng.below(keys.len() as u64) as usize];
                 let d = self.resident_density(k, now_ms);
-                if worst.map(|w| d < w.1).unwrap_or(true) {
-                    worst = Some((k, d));
+                // An object belonging to the arriving application is never protected from
+                // it: moving bytes around inside one application does not change what that
+                // application holds, and treating it as protected would mean a single-tenant
+                // cache could never evict anything.
+                let protected = match self.store.get(k) {
+                    Some(e) => e.application != incoming_app
+                        && self.store.resident_bytes_of(&e.application) <= floor,
+                    None => false,
+                };
+                let slot = if protected { &mut worst_protected } else { &mut worst };
+                let beats = match *slot {
+                    Some((_, best)) => d < best,
+                    None => true,
+                };
+                if beats {
+                    *slot = Some((k, d));
                 }
             }
-            match worst {
+            match worst.or(worst_protected) {
                 Some((k, d)) if d <= incoming_density * 1.05 => {
                     self.drop_key(k, Removal::Evicted, d, incoming_density);
                     evicted.push(k);
@@ -824,9 +870,6 @@ impl Engine {
             _ => self.store.remove(key),
         };
         let Some(e) = removed else { return };
-        if let Some(held) = self.resident_bytes.get_mut(&e.application) {
-            *held = held.saturating_sub(e.size_bytes);
-        }
         if reason == Removal::Expired {
             self.store.expirations += 1;
         }
@@ -1907,5 +1950,138 @@ mod tests {
         // And the sentence has to actually say something.
         let inv = entries.iter().find(|x| x.kind == "invalidate").unwrap();
         assert!(inv.message.contains("postgres"), "the log does not say where the change came from");
+    }
+
+    // ------------------------------------------------------------ per-application floors
+
+    /// Admit `n` objects of `size` bytes belonging to `app`, without asserting on the
+    /// outcome: a scan is *supposed* to be partly refused, and a helper that insists on
+    /// admission would be testing the wrong thing.
+    fn flood(e: &mut Engine, app: &str, first_key: KeyId, n: u64, size: u64, at: f64) {
+        for i in 0..n {
+            let c = ctx(app, size, &[], 0.0);
+            e.put(first_key + i, Value::Null, &c, db_cost(40.0), at + i as f64);
+        }
+    }
+
+    #[test]
+    fn a_scan_in_one_application_cannot_empty_another() {
+        // 1 MB pool, two tenants. Recommendation fills it first; analytics then scans a
+        // stream of never-reused rows through it. Every single one of those evictions is
+        // defensible on value density, and the sum of them would be a cache that has
+        // forgotten recommendation entirely.
+        let mut e = engine(1024 * 1024);
+        flood(&mut e, "recommendation", 1, 600, 1_600, 0.0);
+        let before = e.store.resident_bytes_of("recommendation");
+        assert!(before > 0, "test setup never got recommendation into the pool");
+
+        flood(&mut e, "analytics", 10_000, 4_000, 1_600, 1_000.0);
+
+        assert!(
+            e.store.resident_bytes_of("analytics") > 0,
+            "analytics never got in, so this proves nothing about protecting anyone from it"
+        );
+
+        let after = e.store.resident_bytes_of("recommendation");
+        let floor = e.floor_bytes();
+        // One object of slack: protection is decided before the eviction, so the last
+        // unprotected victim can carry its application a single object below the line.
+        assert!(
+            after + 1_600 >= floor.min(before),
+            "a scan in analytics drove recommendation to {after} bytes, below its floor of {floor}"
+        );
+        // And the floor has to be worth having: a "floor" of a handful of bytes would pass
+        // the assertion above while protecting nothing.
+        assert!(
+            after * 8 >= e.store.capacity_bytes() / 10,
+            "recommendation kept only {after} bytes of a {} byte pool",
+            e.store.capacity_bytes()
+        );
+    }
+
+    /// Put an object straight into the pool, bypassing admission.
+    ///
+    /// The eviction rule has to be tested on a pool in a chosen state, and admission is not
+    /// a way to reach one: it is entitled to refuse anything it likes, so a test that fills
+    /// the cache by asking politely is really a test of the admission gate.
+    fn park(e: &mut Engine, app: &str, key: KeyId, size: u64, at: f64) {
+        e.store.insert(Entry {
+            key,
+            value: Value::Null,
+            size_bytes: size,
+            application: app.to_string(),
+            object_type: "object".into(),
+            ttl_ms: 0.0,
+            regen: db_cost(40.0),
+            inserted_ms: at,
+            last_hit_ms: at,
+            hits: 0,
+            score: 1.0,
+        });
+    }
+
+    #[test]
+    fn the_floor_never_stops_the_cache_from_making_room() {
+        // The worst case for a fairness rule: every resident object is protected. Four
+        // applications each holding exactly a quarter of the pool, with the floor turned up
+        // to the whole fair share, means no matter which 32 candidates are sampled, every
+        // one of them belongs to an application sitting on its floor.
+        //
+        // The byte budget is an invariant and fairness is a preference. If protection were
+        // absolute the pool would deadlock at capacity and refuse everything afterwards --
+        // a fairness rule that turns the cache off is not fairness.
+        let mut cfg = Config::default();
+        cfg.cache.capacity_bytes = 256 * 1024;
+        cfg.engine.app_floor_fraction = 1.0;
+        let mut e = Engine::new(cfg, 7);
+
+        let cap = e.store.capacity_bytes();
+        let size = 1_024;
+        let per_app = (cap / 4) / size;
+        for (i, app) in ["a", "b", "c", "d"].iter().enumerate() {
+            for j in 0..per_app {
+                park(&mut e, app, (i as u64 * 1_000) + j, size, 0.0);
+            }
+        }
+        assert!(!e.store.fits(size), "test setup did not fill the pool");
+        assert_eq!(e.floor_bytes(), cap / 4, "every application should be sitting on its floor");
+
+        // An arrival from a fifth application, worth more than anything resident.
+        let freed = e.make_room(size, f64::INFINITY, 1_000.0, "newcomer");
+        assert!(!freed.is_empty(), "every candidate was protected, so nothing was evicted at all");
+        assert!(e.store.fits(size), "room was not made for the arrival");
+    }
+
+    #[test]
+    fn the_pool_never_overruns_its_budget() {
+        // Whatever admission and the floor decide between them, the one thing that must
+        // never happen is the cache holding more bytes than it was given.
+        let mut e = engine(256 * 1024);
+        flood(&mut e, "solo", 1, 2_000, 1_024, 0.0);
+        flood(&mut e, "other", 100_000, 2_000, 4_096, 3_000.0);
+        assert!(
+            e.store.used_bytes() <= e.store.capacity_bytes(),
+            "the pool overran its budget: {} of {}",
+            e.store.used_bytes(),
+            e.store.capacity_bytes()
+        );
+    }
+
+    #[test]
+    fn residency_survives_an_object_being_overwritten() {
+        // The bug this replaced: residency was credited on admission and debited on
+        // removal, and an overwrite is an admission without a removal. Rewriting the same
+        // key charged the application twice and its accounted bytes drifted past the size
+        // of the whole cache.
+        let mut e = engine(64 * 1024 * 1024);
+        let c = ctx("analytics", 1_000, &[], 0.0);
+        for i in 0..50 {
+            e.put(1, Value::Null, &c, db_cost(40.0), i as f64);
+        }
+        assert_eq!(
+            e.store.resident_bytes_of("analytics"),
+            1_000,
+            "one key of 1000 bytes, written 50 times, is still one key of 1000 bytes"
+        );
     }
 }

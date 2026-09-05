@@ -138,6 +138,19 @@ pub struct EngineConfig {
     /// still get an answer immediately while the rebuild happens behind them, which is what
     /// stops a popular key turning into a thundering herd the instant it expires.
     pub soft_ttl_fraction: f64,
+    /// Share of its fair slice that an application's objects are protected from eviction
+    /// by *other* applications.
+    ///
+    /// A single global pool means the loudest workload wins: a scan through analytics will
+    /// evict every recommendation object, and the recommendation service then pays a second
+    /// of CPU per request to rebuild what it had. Neither application did anything wrong and
+    /// no per-object score can prevent it, because each eviction is individually correct.
+    ///
+    /// The floor is `fraction x capacity / applications`. At 0.5 with three applications
+    /// each is guaranteed a sixth of the pool and the remaining half is contested on merit,
+    /// which is the behaviour worth having: isolation where it matters, competition
+    /// everywhere else. Zero disables it and restores a single global pool.
+    pub app_floor_fraction: f64,
     /// How long one caller may hold the rebuild lease for a missing key before another is
     /// allowed to take it. Long enough to cover an honest rebuild, short enough that a
     /// crashed caller cannot wedge the key.
@@ -155,6 +168,7 @@ impl Default for EngineConfig {
             horizon_weights: [0.5, 0.35, 0.15],
             tail_risk_lambda: 0.35,
             soft_ttl_fraction: 0.8,
+            app_floor_fraction: 0.5,
             rebuild_lease_ms: 5_000.0,
         }
     }
@@ -292,8 +306,6 @@ impl Config {
         }
         if let Some(v) = u64_var("AURA__CACHE__L1__CAPACITY_BYTES") {
             self.cache.l1.capacity_bytes = v;
-        }
-        if let Some(v) = bool_var("AURA__CDN__ENABLED") {
         }
         if let Some(v) = bool_var("AURA__CAPACITY__AUTO") {
             self.capacity.auto = v;

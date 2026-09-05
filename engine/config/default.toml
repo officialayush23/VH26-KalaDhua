@@ -42,6 +42,11 @@ tail_risk_lambda = 0.35
 # rebuild is queued behind the reader. Raise it towards 1.0 to prefer freshness over
 # smoothness, lower it to start rebuilding earlier.
 soft_ttl_fraction = 0.8
+# Each application is guaranteed half of its fair slice of the pool; the rest is contested
+# on merit. Without this a scan through one application evicts every object belonging to
+# another, and no per-object score can prevent it because each eviction is correct on its
+# own terms. Set to 0.0 for a single global pool.
+app_floor_fraction = 0.5
 # How long one caller may hold the rebuild lease for a missing key. Long enough to cover an
 # honest origin call, short enough that a caller that died cannot wedge the key.
 rebuild_lease_ms = 5000.0

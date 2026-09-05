@@ -1749,7 +1749,7 @@ async fn connections(State(app): State<Shared>) -> Json<Value> {
                             0.0
                         }),
                         "cost_usd": round4(st.cost_usd),
-                        "resident_bytes": *eng.resident_bytes.get(name).unwrap_or(&0),
+                        "resident_bytes": eng.store.resident_bytes_of(name),
                     }),
                 )
             })
@@ -1797,12 +1797,16 @@ async fn profiles_all(State(app): State<Shared>) -> Json<Value> {
         .apps
         .keys()
         .map(|name| {
-            let held = *eng.resident_bytes.get(name).unwrap_or(&0);
+            let held = eng.store.resident_bytes_of(name);
             json!({
                 "application": name,
                 "customised": eng.profiles.is_customised(name),
                 "resident_bytes": held,
                 "pool_share": round4(held as f64 / cap as f64),
+                // What this application is guaranteed to keep even if every other one is
+                // scanning the pool. Shown beside what it holds so an operator can see the
+                // difference between "quiet" and "being squeezed".
+                "floor_bytes": eng.floor_bytes(),
                 "profile": eng.profiles.get(name),
             })
         })

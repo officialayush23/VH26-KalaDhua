@@ -78,6 +78,12 @@ impl LayerStats {
 pub struct Store {
     entries: AHashMap<KeyId, Entry>,
     order: Vec<KeyId>,
+    /// Bytes each application currently holds.
+    ///
+    /// Maintained here rather than derived on demand because the eviction path needs it on
+    /// every sampled candidate, and walking the pool to answer "how much does analytics
+    /// hold" would turn an O(1) eviction into an O(n) one.
+    resident_by_app: AHashMap<String, u64>,
     l1: AHashMap<KeyId, f64>,
     l1_order: Vec<KeyId>,
     l1_capacity: usize,
@@ -96,6 +102,7 @@ impl Store {
         Self {
             entries: AHashMap::new(),
             order: Vec::new(),
+            resident_by_app: AHashMap::new(),
             l1: AHashMap::new(),
             l1_order: Vec::new(),
             l1_capacity: l1_capacity.max(1),
@@ -171,17 +178,40 @@ impl Store {
     pub fn insert(&mut self, entry: Entry) {
         if let Some(old) = self.entries.remove(&entry.key) {
             self.used_bytes = self.used_bytes.saturating_sub(old.size_bytes);
+            self.credit_app(&old.application, -(old.size_bytes as i64));
             self.order.retain(|k| *k != entry.key);
         }
         self.used_bytes += entry.size_bytes;
+        self.credit_app(&entry.application, entry.size_bytes as i64);
         self.order.push(entry.key);
         self.entries.insert(entry.key, entry);
         self.admissions += 1;
     }
 
+    /// Move an application's resident total, dropping the entry when it reaches zero so an
+    /// application that stops being used stops counting towards the fair share.
+    fn credit_app(&mut self, application: &str, delta: i64) {
+        let slot = self.resident_by_app.entry(application.to_string()).or_insert(0);
+        *slot = (*slot as i64 + delta).max(0) as u64;
+        if *slot == 0 {
+            self.resident_by_app.remove(application);
+        }
+    }
+
+    pub fn resident_bytes_of(&self, application: &str) -> u64 {
+        self.resident_by_app.get(application).copied().unwrap_or(0)
+    }
+
+    /// Applications with at least one resident object. This is the denominator of the fair
+    /// share, so it counts what is actually in the pool rather than what has ever been seen.
+    pub fn application_count(&self) -> usize {
+        self.resident_by_app.len()
+    }
+
     pub fn remove(&mut self, key: KeyId) -> Option<Entry> {
         let e = self.entries.remove(&key)?;
         self.used_bytes = self.used_bytes.saturating_sub(e.size_bytes);
+        self.credit_app(&e.application, -(e.size_bytes as i64));
         self.order.retain(|k| *k != key);
         Some(e)
     }
