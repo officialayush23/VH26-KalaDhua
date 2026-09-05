@@ -28,6 +28,7 @@ from starlette.routing import Route
 
 from common.costing import CostMeter, CostVector
 from common.service import AppService, build_app, configure_logging
+from common.control import control_page, control_start, control_state, control_stop
 from common.storefront import recommendation_page, storefront_route
 from common.settings import get_settings
 from recommendation import data, model
@@ -218,6 +219,13 @@ def create_app():  # noqa: ANN201 - Starlette application factory
         [
             Route("/", storefront_route(recommendation_page, users=data.N_USERS), methods=["GET"]),
             Route("/profile", profile, methods=["GET"]),
+            # The traffic simulator, as buttons. It runs apps/simulator/driver.py as a child
+            # process rather than reimplementing it, so the demo and the benchmark cannot
+            # disagree about what the workload was.
+            Route("/control", control_page, methods=["GET"]),
+            Route("/control/start", control_start, methods=["POST"]),
+            Route("/control/stop", control_stop, methods=["POST"]),
+            Route("/control/state", control_state, methods=["GET"]),
         ],
     )
 
