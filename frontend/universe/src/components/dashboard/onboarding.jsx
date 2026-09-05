@@ -84,6 +84,8 @@ export function OnboardingPanel({ frame }) {
     try {
       await del(`/v1/keys/${encodeURIComponent(id)}`)
       await refresh()
+    } catch (err) {
+      setError(String(err.message ?? err))
     } finally {
       setBusy(false)
     }
@@ -191,16 +193,21 @@ export function OnboardingPanel({ frame }) {
 /// call and falls quiet on its own when it stops.
 function ConnectedServices() {
   const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
 
   useEffect(() => {
     let alive = true
     const load = async () => {
       try {
         const d = await get("/v1/connections")
-        if (alive) setData(d)
-      } catch {
-        // The panel simply stays on its last answer; the console has louder ways of
-        // saying the engine is unreachable.
+        if (alive) {
+          setData(d)
+          setError(null)
+        }
+      } catch (err) {
+        // "Nobody is connected" and "the engine would not tell me" look identical on this
+        // panel and have completely different fixes, so the second one has to say so.
+        if (alive) setError(String(err.message ?? err))
       }
     }
     load()
@@ -221,6 +228,11 @@ function ConnectedServices() {
       subtitle="Observed, not declared. A service appears the moment it makes its first authenticated call, and goes quiet on its own."
       actions={<Pill tone={live > 0 ? "accent" : "default"}>{live} live now</Pill>}
     >
+      {error && (
+        <p className="mb-3 rounded-lg border border-rose-400/40 bg-rose-400/10 px-3 py-2 text-[13px] text-rose-300">
+          {error}
+        </p>
+      )}
       {keys.length === 0 && unkeyed.length === 0 ? (
         <p className="text-[13.5px] text-muted-foreground">
           Nothing has called this engine yet. Mint a key above and point a service at it.

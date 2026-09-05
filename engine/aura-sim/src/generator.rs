@@ -94,6 +94,23 @@ impl Generator {
         rps
     }
 
+    /// The rate before any disturbance is applied, which is the thing an operator sets.
+    pub fn base_rps(&self) -> f64 {
+        self.spec.base_rps
+    }
+
+    /// Change the offered load at runtime.
+    ///
+    /// A scenario ships with a rate that suits it, but the rate and the shape are two
+    /// different questions: "what does this cache do under a flash crowd" and "what does it
+    /// do at four hundred requests a second" both need answering, and tying them together
+    /// means neither can be asked on its own. The floor is one request a second rather than
+    /// zero because a generator at zero is indistinguishable from a stopped one, and the
+    /// console already has a stop button that says so honestly.
+    pub fn set_base_rps(&mut self, rps: f64) {
+        self.spec.base_rps = rps.clamp(1.0, 20_000.0);
+    }
+
     /// Advance virtual time and return the requests that fall in the window.
     pub fn step(&mut self, dt_ms: f64) -> Vec<Request> {
         let count = ((self.rps() * dt_ms) / 1000.0).round() as usize;

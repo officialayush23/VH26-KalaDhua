@@ -542,6 +542,7 @@ const ATTACKS = [
 export function Controls({ frame, send, status }) {
   const [scenarios, setScenarios] = useState([])
   const [busy, setBusy] = useState(null)
+  const [rps, setRps] = useState("")
   const sim = frame?.sim ?? {}
 
   useEffect(() => {
@@ -553,9 +554,20 @@ export function Controls({ frame, send, status }) {
   const fire = async (attack) => {
     setBusy(attack)
     if (!send({ type: "attack", attack, duration_s: 25 })) {
-      await post("/v1/sim/attack", { attack, duration_s: 25 })
+      // The socket is the fast path; when it is down this is the same command over REST,
+      // and a refusal here is worth seeing rather than swallowing.
+      await post("/v1/sim/attack", { attack, duration_s: 25 }).catch(() => {})
     }
     setTimeout(() => setBusy(null), 900)
+  }
+
+  // The rate is set separately from the speed multiplier on purpose. Speed scales virtual
+  // time, so it stretches the scenario's own disturbances along with the arrival rate;
+  // "how much load can this take" is a different question and needs its own control.
+  const applyRps = async () => {
+    const target = Number(rps)
+    if (!Number.isFinite(target) || target <= 0) return
+    await post("/v1/sim/rps", { rps: target }).catch(() => {})
   }
 
   const current = scenarios.find((s) => s.id === sim.scenario)
@@ -575,6 +587,12 @@ export function Controls({ frame, send, status }) {
             {sim.running ? "running" : "paused"}
           </Pill>
           <Pill>{Number(sim.rps ?? 0).toLocaleString()} req/s</Pill>
+          {Number(sim.base_rps ?? 0) > 0 &&
+            Math.abs(Number(sim.rps ?? 0) - Number(sim.base_rps)) > 1 && (
+              // The two numbers apart means something is disturbing the traffic, which is
+              // the most useful single fact on the page while it is happening.
+              <Pill tone="warn">asked for {Number(sim.base_rps).toLocaleString()}</Pill>
+            )}
         </div>
       }
       footer={current?.description}
@@ -603,6 +621,25 @@ export function Controls({ frame, send, status }) {
               </option>
             ))}
           </select>
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[12px] uppercase tracking-wide text-muted-foreground">
+            Offered load
+          </label>
+          <div className="flex items-center gap-1">
+            <input
+              type="number"
+              min="1"
+              value={rps}
+              placeholder={String(Math.round(Number(sim.base_rps ?? 0)) || 60)}
+              onChange={(e) => setRps(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && applyRps()}
+              className="h-9 w-24 rounded-lg border border-border bg-background px-2.5 text-[13.5px]"
+            />
+            <Button size="sm" variant="outline" onClick={applyRps} disabled={status === "offline"}>
+              req/s
+            </Button>
+          </div>
         </div>
         <div className="flex flex-col gap-1">
           <label className="text-[12px] uppercase tracking-wide text-muted-foreground">
@@ -701,10 +738,12 @@ export function Controls({ frame, send, status }) {
 export function BenchPanel() {
   const [report, setReport] = useState(null)
   const [running, setRunning] = useState(false)
+  const [error, setError] = useState(null)
   const [scenario, setScenario] = useState("expensive_tail")
 
   const run = async () => {
     setRunning(true)
+    setError(null)
     try {
       const r = await post("/v1/bench/run", {
         scenario,
@@ -717,6 +756,8 @@ export function BenchPanel() {
         seed: 42,
       })
       setReport(r)
+    } catch (err) {
+      setError(String(err.message ?? err))
     } finally {
       setRunning(false)
     }
@@ -762,7 +803,12 @@ export function BenchPanel() {
           : "Takes a few seconds. 60,000 requests through LRU, LFU, Greedy-Dual Size and the engine, against the optimal offline bound."
       }
     >
-      {!report && (
+      {error && (
+        <p className="mb-3 rounded-lg border border-rose-400/40 bg-rose-400/10 px-3 py-2 text-[13px] text-rose-300">
+          The benchmark did not run: {error}
+        </p>
+      )}
+      {!report && !error && (
         <div className="flex h-40 items-center justify-center rounded-xl border border-dashed border-border text-[13.5px] text-muted-foreground">
           Press run to compare the policies.
         </div>
@@ -895,6 +941,8 @@ export function ModelPanel({ frame }) {
     setBusy(true)
     try {
       setResult(await post("/v1/model/reload", source === "supabase" ? { source } : { path: "models" }))
+    } catch (err) {
+      setResult({ error: String(err.message ?? err) })
     } finally {
       setBusy(false)
     }

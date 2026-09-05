@@ -22,6 +22,7 @@ import { ProfilesPanel } from "@/components/dashboard/profiles"
 import { BaselinesPanel } from "@/components/dashboard/baselines"
 import { ArchitecturePanel } from "@/components/dashboard/architecture"
 import { OnboardingPanel } from "@/components/dashboard/onboarding"
+import { EvidencePanel } from "@/components/dashboard/evidence"
 import { AuthNotice, SessionChip, SignInScreen, useSession } from "@/components/dashboard/signin"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
 import { FlowDiagram } from "@/components/dashboard/flowdiagram"
@@ -47,6 +48,7 @@ const TABS = [
   { id: "overview", label: "Overview" },
   { id: "architecture", label: "Architecture" },
   { id: "flow", label: "Request flow" },
+  { id: "evidence", label: "Evidence" },
   { id: "decisions", label: "Decisions" },
   { id: "tuning", label: "Tuning" },
   { id: "connect", label: "Connect" },
@@ -240,6 +242,13 @@ export function App() {
                 <EnginePanel frame={frame} />
                 <EventsPanel frame={frame} />
               </div>
+            </div>
+          )}
+
+          {tab === "evidence" && (
+            <div className="space-y-4">
+              <Controls frame={frame} send={send} status={status} />
+              <EvidencePanel history={history} frame={frame} />
             </div>
           )}
 

@@ -430,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sim/stop", post(sim_stop))
         .route("/v1/sim/attack", post(sim_attack))
         .route("/v1/sim/speed", post(sim_speed))
+        .route("/v1/sim/rps", post(sim_rps))
         .route("/v1/sim/status", get(sim_status))
         .route("/v1/bench/run", post(bench_run))
         .route("/v1/bench/latest", get(bench_latest))
@@ -536,17 +537,20 @@ fn build_frame(app: &Shared) -> Value {
         let l = app.leases.lock();
         (l.granted, l.suppressed)
     };
-    let (sim_running, sim_scenario, sim_speed, rps, vtime) = {
+    let (sim_running, sim_scenario, sim_speed, rps, base_rps, vtime) = {
         let sim = app.sim.lock();
         match sim.as_ref() {
             Some(s) => (
                 s.running,
                 s.generator.scenario().id().to_string(),
                 s.speed,
+                // The rate now, after any live disturbance, beside the rate that was asked
+                // for. A flash crowd is exactly the gap between these two numbers.
                 s.generator.rps(),
+                s.generator.base_rps(),
                 s.generator.now_ms() / 1000.0,
             ),
-            None => (false, "none".to_string(), 1.0, 0.0, eng.now_ms / 1000.0),
+            None => (false, "none".to_string(), 1.0, 0.0, 0.0, eng.now_ms / 1000.0),
         }
     };
 
@@ -599,7 +603,8 @@ fn build_frame(app: &Shared) -> Value {
     json!({
         "t": now_epoch_ms(),
         "virtual_time_s": round2(vtime),
-        "sim": { "running": sim_running, "scenario": sim_scenario, "speed": sim_speed, "rps": round2(rps) },
+        "sim": { "running": sim_running, "scenario": sim_scenario, "speed": sim_speed,
+                 "rps": round2(rps), "base_rps": round2(base_rps) },
         "traffic": { "rps": round2(rps) },
         "layers": {
             "l1": { "hits": eng.store.l1_stats.hits, "misses": eng.store.l1_stats.misses,
@@ -878,7 +883,14 @@ async fn auth_me(
     State(app): State<Shared>,
     caller: Option<axum::Extension<auth::Caller>>,
 ) -> Json<Value> {
-    let who = caller.as_ref().map(|axum::Extension(c)| c.label());
+    // `Anonymous` is a caller the gate lets through, not a caller who identified itself.
+    // Reporting it as signed in told the console it had a session it does not have, which
+    // is the worst possible answer: the console stops asking for a password and every
+    // gated call it makes afterwards is a 401 it cannot explain.
+    let who = caller.and_then(|axum::Extension(c)| match c {
+        auth::Caller::Anonymous => None,
+        identified => Some(identified.label()),
+    });
     Json(json!({
         "signed_in": who.is_some(),
         "who": who,
@@ -2069,8 +2081,30 @@ async fn sim_attack(State(app): State<Shared>, Json(body): Json<AttackBody>) -> 
 }
 
 #[derive(Deserialize)]
+struct RpsBody {
+    rps: f64,
+}
+
+#[derive(Debug, Deserialize)]
 struct SpeedBody {
     speed: f64,
+}
+
+/// Set the offered load, in requests per second.
+///
+/// Distinct from `/v1/sim/speed`, which multiplies the passage of virtual time and so
+/// scales the rate and every duration in the scenario together. This changes only the
+/// arrival rate, which is what you want when the question is "how much traffic can it take"
+/// rather than "what happens over the next simulated hour".
+async fn sim_rps(State(app): State<Shared>, Json(body): Json<RpsBody>) -> Json<Value> {
+    let mut sim = app.sim.lock();
+    match sim.as_mut() {
+        Some(s) => {
+            s.generator.set_base_rps(body.rps);
+            Json(json!({ "rps": s.generator.base_rps() }))
+        }
+        None => Json(json!({ "error": "no scenario is running; start one before setting a rate" })),
+    }
 }
 
 async fn sim_speed(State(app): State<Shared>, Json(body): Json<SpeedBody>) -> Json<Value> {

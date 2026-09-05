@@ -31,6 +31,8 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+
+from .l1 import L1Cache, FreshnessClass
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -105,7 +107,7 @@ class RegenOutcome:
     size_bytes: int
     admitted: bool | None
     reason_code: str
-    served_from: Literal["cache", "origin"]
+    served_from: Literal["l1", "cache", "origin"]
     serve_ms: float
     # The object genuinely does not exist, and the cache is remembering that rather than
     # asking the origin again. Callers turn this into their own 404.
@@ -189,6 +191,7 @@ class AuraClient:
         breaker_reset_s: float | None = None,
         api_key: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        l1_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         settings = get_settings()
         self.base_url = (base_url or settings.aura_base_url).rstrip("/")
@@ -221,6 +224,13 @@ class AuraClient:
         self._outage_logged = False
         self._closed = False
 
+        # The in-process tier. L1 removes a network round trip; L2 removes a rebuild and
+        # protects the origin across the whole fleet. Only L2 can reason about value,
+        # because only L2 sees every process's demand, so L1 is deliberately a plain LRU:
+        # two adaptive policies fighting over the same objects would make every measurement
+        # here ambiguous.
+        self.l1 = L1Cache(max_bytes=l1_bytes)
+
         # Last measured regeneration cost per key, so a hit can be credited with
         # the spend it actually avoided rather than an average.
         self._cost_memo: OrderedDict[str, tuple[CostVector, float]] = OrderedDict()
@@ -235,6 +245,8 @@ class AuraClient:
             "regens": 0,
             "cache_errors": 0,
             "breaker_skips": 0,
+            # Served from this process, without touching the network at all.
+            "l1_hits": 0,
             # Origin calls avoided for keys that do not exist. Counted separately from
             # ordinary hits because they are the ones a value-scored cache is most likely
             # to have thrown away.
@@ -409,6 +421,10 @@ class AuraClient:
         caller instead of being swallowed, but it must not take the application down with
         it: the TTL is still there as a backstop.
         """
+        # Local copies first, and unconditionally. If the network call below fails, the one
+        # thing that must not happen is this process continuing to serve the value it was
+        # just told is wrong out of its own memory.
+        self.l1.invalidate_tags(tags)
         if not tags:
             return {"matched": 0, "keys_hard": 0, "keys_soft": 0}
         if not self._breaker.allow():
@@ -489,6 +505,9 @@ class AuraClient:
         instead would empty a large part of the cache at once and send the whole miss
         stream at the origin, which is the cache causing the outage it exists to prevent.
         """
+        # A new generation makes every locally-held object of the old one wrong, and L1 has
+        # no notion of a namespace version, so the only correct answer here is to drop it all.
+        self.l1.clear()
         if not self._breaker.allow():
             self._counters["breaker_skips"] += 1
             return None
@@ -585,6 +604,7 @@ class AuraClient:
         cost_hint: CostVector | None = None,
         depends_on: list[str] | None = None,
         namespace: str | None = None,
+        freshness: FreshnessClass | None = None,
     ) -> Any:
         """Serve `key` from the cache, or regenerate it and report the real cost."""
         outcome = await self.get_or_regen_detailed(
@@ -598,6 +618,7 @@ class AuraClient:
             cost_hint=cost_hint,
             depends_on=depends_on,
             namespace=namespace,
+            freshness=freshness,
         )
         return outcome.value
 
@@ -614,6 +635,7 @@ class AuraClient:
         cost_hint: CostVector | None = None,
         depends_on: list[str] | None = None,
         namespace: str | None = None,
+        freshness: FreshnessClass | None = None,
     ) -> RegenOutcome:
         """`get_or_regen`, but returning the full accounting for the call.
 
@@ -622,8 +644,34 @@ class AuraClient:
         removes exactly the objects built from that row -- and nothing else.
         """
         started = time.perf_counter()
+        # An object built from named rows is `write_bound` unless the caller says otherwise.
+        # Invalidating L2 is one message to one service; invalidating L1 means reaching every
+        # process that might hold a copy, and one that was starting up or briefly partitioned
+        # will keep serving the old value. Defaulting row-derived objects out of L1 makes the
+        # safe answer the one you get by not thinking about it.
+        klass: FreshnessClass = freshness or ("write_bound" if depends_on else "time_bound")
 
         if not force_fresh:
+            # L1 first. A hit here costs no network at all, so it is reported as its own
+            # tier rather than folded into the cache hit rate -- the two tiers save
+            # different things and a blended number would hide which one is working.
+            local = self.l1.get(key)
+            if local is not None:
+                saved, size_bytes = self._recall_cost(key)
+                self._counters["saved_usd"] += saved
+                self._counters["l1_hits"] += 1
+                return RegenOutcome(
+                    value=local.value,
+                    hit=True,
+                    cost=CostVector(),
+                    cost_usd=saved,
+                    size_bytes=local.size_bytes or size_bytes,
+                    admitted=None,
+                    reason_code="l1_hit",
+                    served_from="l1",
+                    serve_ms=(time.perf_counter() - started) * 1000.0,
+                )
+
             entry = await self.get(key, encoding=encoding)
             if entry is not None:
                 saved, size_bytes = self._recall_cost(key)
@@ -645,6 +693,14 @@ class AuraClient:
                         serve_ms=(time.perf_counter() - started) * 1000.0,
                         absent=True,
                     )
+                self.l1.put(
+                    key,
+                    entry.value,
+                    size_bytes=size_bytes or 1,
+                    ttl_ms=ttl_ms,
+                    freshness_class=klass,
+                    tags=depends_on or (),
+                )
                 return RegenOutcome(
                     value=entry.value,
                     hit=True,
@@ -707,6 +763,18 @@ class AuraClient:
             namespace=namespace,
         )
         result = await self.put(key, stored, context, encoding=encoding)
+        if not absent:
+            # A remembered absence is deliberately L2-only: it is the cheapest thing in the
+            # cache to rebuild and the most embarrassing to serve stale, because the object
+            # appearing is exactly the event that makes the memory wrong.
+            self.l1.put(
+                key,
+                value,
+                size_bytes=size_bytes,
+                ttl_ms=effective_ttl,
+                freshness_class=klass,
+                tags=depends_on or (),
+            )
 
         return RegenOutcome(
             value=value,
@@ -772,6 +840,8 @@ class AuraClient:
             "spent_usd": round(counters["spent_usd"], 8),
             "saved_usd": round(counters["saved_usd"], 8),
             "tracked_keys": len(self._cost_memo),
+            "l1_hits": int(counters["l1_hits"]),
+            "l1": self.l1.snapshot(),
         }
 
 

@@ -142,7 +142,9 @@ async function ask(url, label, el) {
     const res = await fetch(url);
     const body = await res.json();
     const ms = performance.now() - t0;
-    const hit = body.served_from === "cache";
+    // Either tier counts as a hit for the shopper: "l1" is this process's own copy and
+    // "cache" is the engine. Only "origin" means somebody paid to rebuild it.
+    const hit = body.served_from === "cache" || body.served_from === "l1";
     const cost = body.regen_cost_usd || 0;
 
     served += 1;

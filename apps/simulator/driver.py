@@ -138,7 +138,9 @@ class Metrics:
         if not recent:
             return {"rps": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "hit_rate": 0.0, "n": 0}
         lats = sorted(lat for _, lat, _ in recent)
-        hits = sum(1 for _, _, c in recent if c in ("l1", "l2"))
+        # The two cache tiers, by the names the services actually report: "l1" is the
+        # in-process copy and "cache" is the engine. Anything else was a rebuild.
+        hits = sum(1 for _, _, c in recent if c in ("l1", "cache"))
         return {
             "rps": round(len(recent) / seconds, 1),
             "p50_ms": round(lats[len(lats) // 2], 1),
