@@ -598,7 +598,10 @@ impl Engine {
         );
         f[EXTRA_OFFSET..].copy_from_slice(&extra);
 
-        let reuse = self.predictor.reuse(&f);
+        // Priced the same way a resident is priced. An arrival has no age, so the experts
+        // see it for what it is rather than crediting it with time served.
+        let model_reuse = self.predictor.reuse(&f);
+        let reuse = self.blended_reuse(&f, 0.0, model_reuse);
         let value_density = self.value_density(&f, reuse, ctx.size_bytes, cost_usd, &ctx.application);
         // The bar for admission is the object that would have to be evicted to make room,
         // not a running average of what has been arriving. Comparing an arrival against
@@ -888,6 +891,37 @@ impl Engine {
     /// going to clear a bar scored below one, so nothing was ever refused. Both sides now
     /// end in the same expression, and the only thing the expert blend and the model do is
     /// supply the reuse estimate that expression consumes.
+    /// Reuse probability as the engine actually believes it: the policy experts, weighted
+    /// by the bandit, blended with the model according to how much the model has earned.
+    ///
+    /// This exists as one function because it must be applied identically to an arrival and
+    /// to a resident. It was not. Residents were priced with this blend while arrivals were
+    /// priced by the model alone, and the experts reward accumulated hits, so every resident
+    /// was flattered against every newcomer. The pool filled once and then refused almost
+    /// everything: 83% of arrivals rejected, and a 644 KB object with a 98% reuse
+    /// probability turned away because "nothing resident was worth less than it". The two
+    /// numbers being compared were not measuring the same thing.
+    fn blended_reuse(&self, f: &Features, age_ms: f64, model: [f64; 3]) -> [f64; 3] {
+        let mixture = self.bandit.mixture();
+        let expert: f64 = Policy::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, p)| mixture[i] * p.utility(f, age_ms))
+            .sum();
+        // The experts rank objects but do not speak probabilities. Squashing puts the
+        // blended score on the same [0, 1) footing as the model output so the two can be
+        // mixed at all.
+        let expert_reuse = expert / (1.0 + expert.max(0.0));
+        let share = self
+            .cfg
+            .engine
+            .ml_confidence_floor
+            .max(self.predictor.confidence())
+            .clamp(0.0, 1.0);
+        let blend = |m: f64| expert_reuse * (1.0 - share) + m * share;
+        [blend(model[0]), blend(model[1]), blend(model[2])]
+    }
+
     fn resident_density(&self, key: KeyId, now_ms: f64) -> f64 {
         let e = match self.store.get(key) {
             Some(e) => e,
@@ -915,26 +949,7 @@ impl Engine {
         }
 
         let cost = self.cfg.pricing.regen_cost_usd(&e.regen);
-        let mixture = self.bandit.mixture();
-        let expert: f64 = Policy::ALL
-            .iter()
-            .enumerate()
-            .map(|(i, p)| mixture[i] * p.utility(&f, age))
-            .sum();
-        // The experts rank objects but do not speak probabilities. Squashing turns the
-        // blended score into something on the same [0, 1) footing as the model output so
-        // the two can be mixed at all.
-        let expert_reuse = expert / (1.0 + expert.max(0.0));
-        let model_reuse = self.predictor.reuse_peek(&f);
-        let share = self
-            .cfg
-            .engine
-            .ml_confidence_floor
-            .max(self.predictor.confidence())
-            .clamp(0.0, 1.0);
-
-        let blended = |model: f64| expert_reuse * (1.0 - share) + model * share;
-        let reuse = [blended(model_reuse[0]), blended(model_reuse[1]), blended(model_reuse[2])];
+        let reuse = self.blended_reuse(&f, age, self.predictor.reuse_peek(&f));
 
         self.value_density(&f, reuse, e.size_bytes, cost, &e.application)
             * e.ttl_remaining_frac(now_ms).max(0.05)
