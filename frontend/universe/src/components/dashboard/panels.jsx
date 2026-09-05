@@ -9,7 +9,7 @@ import { Bar, Gauge, Legend, LineChart, Metric, Panel, Pill } from "./primitives
 const POLICY_TONES = {
   lru: "bg-slate-400",
   lfu: "bg-sky-400",
-  gdsf: "bg-violet-400",
+  gds: "bg-violet-400",
   tiny_lfu: "bg-teal-400",
   cost_aware: "bg-amber-400",
   trend_aware: "bg-rose-400",
@@ -18,7 +18,7 @@ const POLICY_TONES = {
 const POLICY_MEANING = {
   lru: "keeps whatever was touched most recently",
   lfu: "keeps whatever is touched most often",
-  gdsf: "weighs frequency against cost and size",
+  gds: "weighs cost against size, with an inflation term so old objects age out",
   tiny_lfu: "frequency sketch, resists one-off keys",
   cost_aware: "keeps whatever is most expensive per byte",
   trend_aware: "keeps whatever is rising fastest",
@@ -708,7 +708,10 @@ export function BenchPanel() {
     try {
       const r = await post("/v1/bench/run", {
         scenario,
-        policies: ["lru", "lfu", "gdsf", "cost_aware", "aura"],
+        // The three the brief names, and the engine. Every other policy in the roster is
+        // still implemented and still reachable through POST /v1/bench/run; this is the
+        // comparison the demo makes, not the limit of what can be run.
+        policies: ["lru", "lfu", "gds", "aura"],
         capacity_bytes: 134217728,
         requests: 60000,
         seed: 42,
@@ -756,7 +759,7 @@ export function BenchPanel() {
       footer={
         report
           ? "Results are also published to Supabase when the engine has credentials."
-          : "Takes a few seconds. 60,000 requests through five policies plus the optimal bound."
+          : "Takes a few seconds. 60,000 requests through LRU, LFU, Greedy-Dual Size and the engine, against the optimal offline bound."
       }
     >
       {!report && (

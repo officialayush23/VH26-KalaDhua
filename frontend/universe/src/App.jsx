@@ -20,6 +20,7 @@ import {
 import { ActivityLog } from "@/components/dashboard/activity"
 import { ProfilesPanel } from "@/components/dashboard/profiles"
 import { BaselinesPanel } from "@/components/dashboard/baselines"
+import { ArchitecturePanel } from "@/components/dashboard/architecture"
 import { OnboardingPanel } from "@/components/dashboard/onboarding"
 import { AuthNotice, SessionChip, useSession } from "@/components/dashboard/signin"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
@@ -36,6 +37,7 @@ const STATUS = {
 const TABS = [
   { id: "live", label: "Live" },
   { id: "overview", label: "Overview" },
+  { id: "architecture", label: "Architecture" },
   { id: "flow", label: "Request flow" },
   { id: "decisions", label: "Decisions" },
   { id: "tuning", label: "Tuning" },
@@ -203,6 +205,13 @@ export function App() {
                 <PolicyPanel frame={frame} />
                 <ApplicationsPanel frame={frame} />
               </div>
+            </div>
+          )}
+
+          {tab === "architecture" && (
+            <div className="space-y-4">
+              <ArchitecturePanel frame={frame} status={status} />
+              <ApplicationsPanel frame={frame} />
             </div>
           )}
 
