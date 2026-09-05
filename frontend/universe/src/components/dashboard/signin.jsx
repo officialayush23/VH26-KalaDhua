@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react"
 
-import { authAvailable, currentUser, signIn, signOut, watchSession } from "@/lib/session"
+import {
+  authAvailable,
+  currentUser,
+  hasAdminToken,
+  setAdminToken,
+  signIn,
+  signOut,
+  watchSession,
+} from "@/lib/session"
 import { cn } from "@/lib/utils"
 
 /// Sign in with the account system the project already has.
@@ -26,22 +34,19 @@ export function useSession() {
 
 export function SessionChip({ session }) {
   const [open, setOpen] = useState(false)
+  const [admin, setAdmin] = useState(hasAdminToken())
 
-  if (!authAvailable) {
-    return (
-      <span className="rounded-xl border border-border bg-card px-3 py-2 text-[12.5px] text-muted-foreground">
-        local console
-      </span>
-    )
-  }
-
-  if (session) {
+  if (session || admin) {
+    const label = session ? (session.user?.email ?? "signed in") : "operator token"
     return (
       <div className="flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-2">
         <span className="h-1.5 w-1.5 rounded-full bg-primary" />
-        <span className="text-[12.5px]">{session.user?.email ?? "signed in"}</span>
+        <span className="text-[12.5px]">{label}</span>
         <button
-          onClick={() => signOut()}
+          onClick={() => {
+            signOut()
+            setAdmin(false)
+          }}
           className="text-[12.5px] font-medium text-muted-foreground hover:text-foreground"
         >
           sign out
@@ -58,14 +63,23 @@ export function SessionChip({ session }) {
       >
         Sign in
       </button>
-      {open && <SignInDialog onClose={() => setOpen(false)} />}
+      {open && (
+        <SignInDialog
+          onClose={() => {
+            setOpen(false)
+            setAdmin(hasAdminToken())
+          }}
+        />
+      )}
     </>
   )
 }
 
 function SignInDialog({ onClose }) {
+  const [mode, setMode] = useState(authAvailable ? "account" : "token")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
+  const [operator, setOperator] = useState("")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
 
@@ -74,7 +88,14 @@ function SignInDialog({ onClose }) {
     setBusy(true)
     setError(null)
     try {
-      await signIn(email, password)
+      if (mode === "token") {
+        if (operator.trim().length < 16) {
+          throw new Error("that token is too short to be the one the engine was given")
+        }
+        setAdminToken(operator)
+      } else {
+        await signIn(email, password)
+      }
       onClose()
     } catch (err) {
       setError(err?.message ?? String(err))
@@ -95,11 +116,36 @@ function SignInDialog({ onClose }) {
       >
         <h2 className="text-[16px] font-semibold">Sign in to the console</h2>
         <p className="mt-1 text-[12.5px] text-muted-foreground">
-          Your Supabase account. The engine verifies the token Supabase issues; this page
-          never stores a password.
+          {mode === "account"
+            ? "Your Supabase account. The engine verifies the token Supabase issues; this page never stores a password."
+            : "The operator token the engine was started with. It stays in this browser and is sent only to the engine."}
         </p>
 
-        <label className="mt-4 block">
+        <div className="mt-3 flex gap-1.5">
+          <ModeTab id="account" mode={mode} setMode={setMode} disabled={!authAvailable}>
+            Account
+          </ModeTab>
+          <ModeTab id="token" mode={mode} setMode={setMode}>
+            Operator token
+          </ModeTab>
+        </div>
+
+        {mode === "token" && (
+          <label className="mt-4 block">
+            <span className="text-[12.5px] font-medium text-muted-foreground">
+              AURA_ADMIN_TOKEN
+            </span>
+            <input
+              type="password"
+              autoFocus
+              value={operator}
+              onChange={(e) => setOperator(e.target.value)}
+              className="mt-1.5 h-10 w-full rounded-xl border border-border bg-background px-3 font-mono text-[13px] outline-none focus:border-primary/60"
+            />
+          </label>
+        )}
+
+        <label className={cn("mt-4 block", mode !== "account" && "hidden")}>
           <span className="text-[12.5px] font-medium text-muted-foreground">Email</span>
           <input
             type="email"
@@ -109,7 +155,7 @@ function SignInDialog({ onClose }) {
             className="mt-1.5 h-10 w-full rounded-xl border border-border bg-background px-3 text-[14px] outline-none focus:border-primary/60"
           />
         </label>
-        <label className="mt-3 block">
+        <label className={cn("mt-3 block", mode !== "account" && "hidden")}>
           <span className="text-[12.5px] font-medium text-muted-foreground">Password</span>
           <input
             type="password"
@@ -139,11 +185,29 @@ function SignInDialog({ onClose }) {
             disabled={busy}
             className="rounded-lg bg-primary px-3.5 py-1.5 text-[13px] font-semibold text-primary-foreground disabled:opacity-50"
           >
-            {busy ? "Signing in…" : "Sign in"}
+            {busy ? "Signing in…" : mode === "token" ? "Use token" : "Sign in"}
           </button>
         </div>
       </form>
     </div>
+  )
+}
+
+function ModeTab({ id, mode, setMode, disabled, children }) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => setMode(id)}
+      className={cn(
+        "rounded-lg border px-3 py-1.5 text-[12.5px] font-medium transition-colors disabled:opacity-40",
+        mode === id
+          ? "border-primary/50 bg-primary/10 text-foreground"
+          : "border-border bg-background text-muted-foreground hover:text-foreground"
+      )}
+    >
+      {children}
+    </button>
   )
 }
 

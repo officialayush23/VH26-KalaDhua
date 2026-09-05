@@ -634,7 +634,8 @@ fn build_frame(app: &Shared) -> Value {
             }
         },
         "auth": {
-            "enforced": app.auth.lock().is_enforced()
+            "enforced": app.auth.lock().is_enforced(),
+            "admin_token_accepted": app.auth.lock().has_admin_token()
         },
         "fidelity": {
             // Where the requests came from, not what we wish they came from. The generator
@@ -715,7 +716,24 @@ async fn gate(
             })
         });
 
+    // The lock is taken, the decision is made, and the lock is dropped before anything can
+    // await. A mutex held across a network call is how a cache stops answering.
     let verdict = app.auth.lock().authorise(need, bearer.as_deref());
+    let verdict = match verdict {
+        auth::Verdict::Remote(token) => match app.supabase.as_ref() {
+            Some(sb) => match sb.whoami(&token).await {
+                Ok((subject, email, exp)) => {
+                    app.auth.lock().remember_verified(&token, exp, subject.clone(), email.clone());
+                    Ok(auth::Caller::Person { subject, email })
+                }
+                Err(_) => Err(auth::Denial::Expired),
+            },
+            None => Err(auth::Denial::Missing),
+        },
+        auth::Verdict::Allowed(caller) => Ok(caller),
+        auth::Verdict::Denied(d) => Err(d),
+    };
+
     match verdict {
         Ok(caller) => {
             req.extensions_mut().insert(caller);

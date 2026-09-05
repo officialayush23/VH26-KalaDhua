@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -228,6 +229,52 @@ impl Supabase {
             );
         }
         Ok(entries.len())
+    }
+
+    /// Ask the identity provider who a token belongs to.
+    ///
+    /// This is the fallback for projects whose tokens are signed with an asymmetric key,
+    /// where the project's JWT secret verifies nothing. It is a network call, so it happens
+    /// once per token and the answer is cached until the token's own expiry: the identity
+    /// provider must never end up on the cache's request path.
+    pub async fn whoami(&self, token: &str) -> anyhow::Result<(String, Option<String>, u64)> {
+        let url = format!("{}/auth/v1/user", self.base_url);
+        let res = self
+            .client
+            .get(&url)
+            .header("apikey", &self.key)
+            .header("authorization", format!("Bearer {token}"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!("token rejected by the identity provider: {}", res.status());
+        }
+        let body: Value = res.json().await?;
+        let subject = body
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("no subject in the provider's answer"))?
+            .to_string();
+        let email = body.get("email").and_then(|v| v.as_str()).map(str::to_string);
+        // The provider does not return the expiry here, so trust the token's own claim and
+        // fall back to a short window. Erring short costs one extra call; erring long would
+        // keep a revoked login working.
+        let exp = token
+            .split('.')
+            .nth(1)
+            .and_then(|part| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part).ok()
+            })
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .and_then(|claims| claims.get("exp").and_then(|v| v.as_u64()))
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() + 300)
+                    .unwrap_or(0)
+            });
+        Ok((subject, email, exp))
     }
 
     /// Application keys, as hashes. Read once at boot so a restart does not invalidate every

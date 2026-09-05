@@ -129,10 +129,32 @@ pub enum Mode {
     Enforced,
 }
 
+/// What the gate decided, before any network call.
+///
+/// A token that cannot be checked locally does not fail: Supabase projects created after
+/// the move to asymmetric signing issue ES256 tokens, and their JWT secret verifies nothing.
+/// Those are checked by asking Supabase who the token belongs to, which the gate does after
+/// releasing the lock, because holding a mutex across a network call is how a cache stops
+/// answering.
+pub enum Verdict {
+    Allowed(Caller),
+    Denied(Denial),
+    /// Verify this token with the identity provider, then allow.
+    Remote(String),
+}
+
 pub struct Auth {
     pub mode: Mode,
     jwt_secret: Option<String>,
+    /// A token that grants console access without an identity provider. It exists for the
+    /// first five minutes of a deployment's life, when there is a URL and no way to sign in
+    /// yet, and for automation that should not hold a person's login.
+    admin_token: Option<String>,
     keys: AHashMap<String, ApiKey>,
+    /// Tokens already checked with the provider, with the expiry the provider stated. A
+    /// remote check per request would put the identity provider on the cache's hot path,
+    /// which is the one place it must never be.
+    verified: AHashMap<String, (u64, String, Option<String>)>,
 }
 
 impl Auth {
@@ -150,17 +172,41 @@ impl Auth {
             .or_else(|_| std::env::var("SUPABASE_JWT_SECRET"))
             .ok()
             .filter(|s| !s.trim().is_empty());
-        if mode == Mode::Enforced && jwt_secret.is_none() {
+        let admin_token = std::env::var("AURA_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| s.trim().len() >= 16);
+        if mode == Mode::Enforced && jwt_secret.is_none() && admin_token.is_none() {
             anyhow::bail!(
-                "AURA_AUTH=enforced needs SUPABASE_JWT_KEY to verify console logins; \
-                 refusing to start rather than accepting everyone"
+                "AURA_AUTH=enforced needs SUPABASE_JWT_KEY or AURA_ADMIN_TOKEN (16+ chars) \
+                 so somebody can actually sign in; refusing to start rather than accepting \
+                 everyone"
             );
         }
-        Ok(Self { mode, jwt_secret, keys: AHashMap::new() })
+        Ok(Self {
+            mode,
+            jwt_secret,
+            admin_token,
+            keys: AHashMap::new(),
+            verified: AHashMap::new(),
+        })
     }
 
     pub fn is_enforced(&self) -> bool {
         self.mode == Mode::Enforced
+    }
+
+    pub fn has_admin_token(&self) -> bool {
+        self.admin_token.is_some()
+    }
+
+    /// Record a token the identity provider vouched for, so the next request on it is
+    /// answered here rather than over the network.
+    pub fn remember_verified(&mut self, token: &str, exp: u64, subject: String, email: Option<String>) {
+        if self.verified.len() > 512 {
+            let now = now_secs();
+            self.verified.retain(|_, (e, _, _)| *e > now);
+        }
+        self.verified.insert(hash_secret(token), (exp, subject, email));
     }
 
     pub fn keys(&self) -> Vec<ApiKey> {
@@ -211,41 +257,69 @@ impl Auth {
     /// `bearer` is whatever came in on `Authorization: Bearer ...` or, for the WebSocket,
     /// the `token` query parameter - browsers cannot set headers on a socket handshake, and
     /// refusing to solve that is how dashboards end up unauthenticated in practice.
-    pub fn authorise(&self, need: Need, bearer: Option<&str>) -> Result<Caller, Denial> {
+    pub fn authorise(&self, need: Need, bearer: Option<&str>) -> Verdict {
         if need == Need::Public {
-            return Ok(Caller::Anonymous);
+            return Verdict::Allowed(Caller::Anonymous);
         }
         let Some(token) = bearer.map(str::trim).filter(|t| !t.is_empty()) else {
             return if self.is_enforced() {
-                Err(Denial::Missing)
+                Verdict::Denied(Denial::Missing)
             } else {
-                Ok(Caller::Anonymous)
+                Verdict::Allowed(Caller::Anonymous)
             };
         };
 
+        // Constant-time-ish comparison is not the concern here - the token is compared once
+        // per request against a value of the operator's own choosing - but length is checked
+        // at load so a blank environment variable cannot become a valid credential.
+        if let Some(admin) = &self.admin_token {
+            if token == admin {
+                return Verdict::Allowed(Caller::Person {
+                    subject: "admin-token".to_string(),
+                    email: None,
+                });
+            }
+        }
+
+        if let Some((exp, subject, email)) = self.verified.get(&hash_secret(token)) {
+            if *exp > now_secs() {
+                return Verdict::Allowed(Caller::Person {
+                    subject: subject.clone(),
+                    email: email.clone(),
+                });
+            }
+        }
+
         if token.starts_with("aura_sk_") {
-            let hash = hash_secret(token);
-            return match self.keys.get(&hash) {
+            let found = match self.keys.get(&hash_secret(token)) {
                 Some(k) if !k.revoked => Ok(Caller::Application {
                     key_id: k.id.clone(),
                     application: k.application.clone(),
                 }),
                 Some(_) => Err(Denial::Revoked),
                 None => Err(Denial::Unknown),
-            }
-            .and_then(|caller| match need {
+            };
+            return match found {
                 // An application key is for the data path and for looking at telemetry. It
                 // cannot re-tune the cache: a leaked key should not be able to change what
                 // the cache optimises for every other application.
-                Need::Control => Err(Denial::Forbidden),
-                _ => Ok(caller),
-            });
+                Ok(_) if need == Need::Control => Verdict::Denied(Denial::Forbidden),
+                Ok(caller) => Verdict::Allowed(caller),
+                Err(d) => Verdict::Denied(d),
+            };
         }
 
         match &self.jwt_secret {
-            Some(secret) => verify_jwt(token, secret),
-            None if self.is_enforced() => Err(Denial::Missing),
-            None => Ok(Caller::Anonymous),
+            Some(secret) => match verify_jwt(token, secret) {
+                Ok(caller) => Verdict::Allowed(caller),
+                // A signature this secret cannot check is not necessarily a bad token: on a
+                // project using asymmetric signing keys the secret is simply the wrong
+                // instrument. Ask the provider rather than refusing someone who is signed in.
+                Err(Denial::Malformed) => Verdict::Remote(token.to_string()),
+                Err(d) => Verdict::Denied(d),
+            },
+            None if self.is_enforced() => Verdict::Remote(token.to_string()),
+            None => Verdict::Allowed(Caller::Anonymous),
         }
     }
 }
@@ -306,6 +380,10 @@ pub fn need_for(method: &str, path: &str) -> Need {
 fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn now_iso() -> String {

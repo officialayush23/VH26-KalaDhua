@@ -160,15 +160,18 @@ transaction mode hands a different backend to every statement.
 
 ---
 
-## 5. Dashboard on Vercel
+## 5. Console on Vercel
 
 `VITE_AURA_URL` is substituted into the bundle at build time, so it is a build variable,
 not a runtime one. Changing it means a rebuild.
 
 - New project → import the repo
-- Root directory: `frontend/universe`
-- Framework preset: Vite. Build `npm run build`, output `dist`
-- Environment variable: `VITE_AURA_URL=https://<engine>.up.railway.app`
+- **Root directory: `frontend/universe`**. `vercel.json` lives there and carries the
+  single-page rewrite, without which a refresh on any panel returns 404.
+- Framework preset: Vite (detected). Build `npm run build`, output `dist`
+- Environment variables:
+  - `VITE_AURA_URL=https://vh26-kaladhua.onrender.com`
+  - `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` for the sign-in form
 
 The live socket URL is derived by swapping the scheme, so an `https` engine gives `wss`
 and there is no mixed-content block. An engine on plain `http` behind an `https` dashboard
@@ -211,6 +214,18 @@ makes onboarding "mint a key, point the service at the URL, watch it appear".
 table. An application key deliberately cannot change how the cache behaves: profiles,
 simulation and capacity need a console login, so a leaked key cannot re-tune the cache for
 everyone else.
+
+**Bootstrapping.** Minting the first key needs console access, and console access needs an
+account, which is a circle on a fresh deployment. `AURA_ADMIN_TOKEN` (16 characters or more)
+breaks it: the engine accepts it as a console credential, so you can mint a key with curl or
+paste it into the console's sign-in dialog under "Operator token". It is a real credential -
+treat it as one, and remove it once real accounts exist.
+
+**Asymmetric projects.** Supabase projects created after the move to asymmetric signing keys
+issue ES256 tokens, which the project's JWT secret cannot verify. The engine handles this
+without configuration: a token it cannot check locally is checked once against
+`/auth/v1/user`, and the answer is cached until that token's own expiry, so the identity
+provider never ends up on the request path.
 
 Mode is explicit, never inferred:
 

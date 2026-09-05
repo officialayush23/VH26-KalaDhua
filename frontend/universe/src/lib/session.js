@@ -24,10 +24,41 @@ export const supabase = authAvailable
 
 let cached = null
 
+// A deployed engine can accept an operator token as well as a login. It exists for the
+// first five minutes of a deployment's life, when there is a URL and no user yet, and it is
+// kept in this browser only: it never reaches Supabase and is never sent anywhere except
+// the engine it was issued for.
+const ADMIN_KEY = "aura.admin.token"
+
+function readAdminToken() {
+  try {
+    return window.localStorage.getItem(ADMIN_KEY) || null
+  } catch {
+    // Private windows and blocked site data throw rather than returning null.
+    return null
+  }
+}
+
+let adminToken = readAdminToken()
+
+export function setAdminToken(value) {
+  adminToken = value && value.trim() ? value.trim() : null
+  try {
+    if (adminToken) window.localStorage.setItem(ADMIN_KEY, adminToken)
+    else window.localStorage.removeItem(ADMIN_KEY)
+  } catch {
+    // Not being able to persist it is survivable; it lasts the session.
+  }
+}
+
+export function hasAdminToken() {
+  return Boolean(adminToken)
+}
+
 /// The current access token, or null. Read synchronously by the socket and the fetch
 /// helpers, which cannot await on every call.
 export function token() {
-  return cached?.access_token ?? null
+  return cached?.access_token ?? adminToken ?? null
 }
 
 export function currentUser() {
@@ -62,6 +93,7 @@ export async function signIn(email, password) {
 }
 
 export async function signOut() {
+  setAdminToken(null)
   if (!supabase) return
   await supabase.auth.signOut()
   cached = null
