@@ -293,6 +293,15 @@ pub struct Engine {
     pub regime_confidence: f64,
     pub override_policy: Option<Policy>,
     pub eviction_threshold: f64,
+    /// A running mean of each expert's raw utility, used to put the six of them on a
+    /// comparable scale before they are mixed.
+    ///
+    /// Without this the blend is arithmetic nonsense. `Lfu` returns an access count (0..100),
+    /// `CostAware` returns dollars over a log of bytes (about 1e-6), and summing them with
+    /// weights near 1/6 means the frequency experts contribute everything while the two
+    /// experts that actually know about cost contribute nothing measurable. The mixture
+    /// weights claim six opinions are being consulted; the arithmetic consults two.
+    pub expert_scale: [f64; 6],
     pub requests: u64,
     pub refreshes: u64,
     pub rejections: u64,
@@ -367,6 +376,7 @@ impl Engine {
             regime_confidence: 0.0,
             override_policy: None,
             eviction_threshold: 0.0,
+            expert_scale: [1.0; 6],
             requests: 0,
             refreshes: 0,
             rejections: 0,
@@ -621,6 +631,7 @@ impl Engine {
 
         // Priced the same way a resident is priced. An arrival has no age, so the experts
         // see it for what it is rather than crediting it with time served.
+        self.observe_expert_scales(&f, 0.0);
         let model_reuse = self.predictor.reuse(&f);
         let reuse = self.blended_reuse(&f, 0.0, model_reuse);
         let value_density = self.value_density(&f, reuse, ctx.size_bytes, cost_usd, &ctx.application);
@@ -969,12 +980,29 @@ impl Engine {
     /// everything: 83% of arrivals rejected, and a 644 KB object with a 98% reuse
     /// probability turned away because "nothing resident was worth less than it". The two
     /// numbers being compared were not measuring the same thing.
+    /// Update the per-expert scale from one observed object.
+    ///
+    /// Fed from arrivals rather than from the objects being scored: arrivals are the stream
+    /// the cache is choosing over, and scoring takes `&self` so it could not learn anyway.
+    /// The window is long because this is a unit conversion rather than a signal -- it should
+    /// track the workload's shape over minutes, not wobble per request.
+    fn observe_expert_scales(&mut self, f: &Features, age_ms: f64) {
+        for (i, p) in Policy::ALL.iter().enumerate() {
+            let u = p.utility(f, age_ms).max(0.0);
+            self.expert_scale[i] = (self.expert_scale[i] * 0.999 + u * 0.001).max(1e-12);
+        }
+    }
+
     fn blended_reuse(&self, f: &Features, age_ms: f64, model: [f64; 3]) -> [f64; 3] {
         let mixture = self.bandit.mixture();
+        // Each expert is divided by its own running mean, so what it contributes is "how does
+        // this object compare with an average one, in my opinion" -- a dimensionless ratio
+        // around 1.0. Six of those can be averaged; six raw utilities in six different units
+        // cannot.
         let expert: f64 = Policy::ALL
             .iter()
             .enumerate()
-            .map(|(i, p)| mixture[i] * p.utility(f, age_ms))
+            .map(|(i, p)| mixture[i] * (p.utility(f, age_ms) / self.expert_scale[i].max(1e-12)))
             .sum();
         // The experts rank objects but do not speak probabilities. Squashing puts the
         // blended score on the same [0, 1) footing as the model output so the two can be
@@ -2083,5 +2111,64 @@ mod tests {
             1_000,
             "one key of 1000 bytes, written 50 times, is still one key of 1000 bytes"
         );
+    }
+
+    // ------------------------------------------------------- expert scale normalisation
+
+    #[test]
+    fn a_cost_aware_expert_can_actually_move_the_blend() {
+        // The bug this covers: the six experts were summed in their own natural units.
+        // `Lfu` returns an access count in the tens; `CostAware` returns dollars divided by a
+        // log of bytes, around 1e-6. Weighted at roughly a sixth each and added, the two
+        // experts that know anything about cost contributed about one part in ten million.
+        // The mixture bar on the dashboard showed six opinions; the arithmetic used two.
+        //
+        // So: two objects identical in every way except rebuild cost must not receive the
+        // same reuse estimate.
+        let mut e = engine(64 * 1024 * 1024);
+
+        // Give the scales a workload to calibrate against, or every expert is still divided
+        // by its initial 1.0 and the test proves nothing.
+        for i in 0..500 {
+            let c = ctx("analytics", 4_000, &[], 0.0);
+            e.put(i, Value::Null, &c, db_cost(40.0), i as f64);
+        }
+
+        let mut cheap = e.features.peek(
+            9_001, 1_000.0, "analytics", "object", 4_000, &db_cost(1.0),
+            aura_core::features::AmbientState { cache_pressure: 0.5, ttl_remaining_frac: 1.0 },
+        );
+        let mut dear = cheap;
+        cheap[aura_core::features::idx::REGEN_COST_USD] = 0.000_001;
+        dear[aura_core::features::idx::REGEN_COST_USD] = 0.010_000;
+
+        let model = [0.3, 0.3, 0.3];
+        let a = e.blended_reuse(&cheap, 0.0, model)[1];
+        let b = e.blended_reuse(&dear, 0.0, model)[1];
+
+        assert!(
+            b > a,
+            "a rebuild ten thousand times dearer scored no higher: {a:.6} against {b:.6}"
+        );
+        assert!(
+            (b - a).abs() > 1e-4,
+            "cost moved the estimate by {:.9}, which is not a difference anything downstream \
+             can act on -- the cost-aware experts are being drowned by the frequency ones",
+            b - a
+        );
+    }
+
+    #[test]
+    fn expert_scales_stay_finite_on_a_workload_that_never_touches_an_expert() {
+        // An expert reading zero for a long stretch must not drive its scale to zero and
+        // start returning infinities into the mixture.
+        let mut e = engine(8 * 1024 * 1024);
+        for i in 0..300 {
+            let c = ctx("analytics", 1_000, &[], 0.0);
+            e.put(i, Value::Null, &c, CostVector::default(), i as f64);
+        }
+        for (i, s) in e.expert_scale.iter().enumerate() {
+            assert!(s.is_finite() && *s > 0.0, "expert {i} scale went to {s}");
+        }
     }
 }

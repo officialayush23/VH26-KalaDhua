@@ -240,7 +240,7 @@ async function retire() {
     const res = await fetch("/retire", { method: "POST" });
     const body = await res.json();
     alert("Namespace '" + (body.namespace || "?") + "' retired to version " + (body.version || "?") +
-          ".\n\nNothing was deleted. New requests carry the new version and miss cleanly; " +
+          ".\\n\\nNothing was deleted. New requests carry the new version and miss cleanly; " +
           "the previous generation ages out under ordinary eviction pressure.");
   } catch (err) {
     alert("Retire failed: " + err.message);
