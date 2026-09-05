@@ -1,0 +1,5 @@
+cd D:\GITHUB\VH26-KalaDhua
+
+python scripts\run_demo.py `
+  --rec-key aura_sk_3f4543bc6fd2937f92d7f26e852cbceb14dad461ab18f4a0cbf0d0bd9f224744 `
+  --ana-key aura_sk_0dca3dab1062b507e4c21a3bc72f70b933f0529ae0fc5285252634a8d38bf233
