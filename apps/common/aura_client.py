@@ -169,6 +169,9 @@ class AuraClient:
         settings = get_settings()
         self.base_url = (base_url or settings.aura_base_url).rstrip("/")
         self.application = application
+        # Kept so the service can report whether it is authenticated without re-reading the
+        # environment, and so an explicitly-passed key is not silently ignored later.
+        self.api_key = api_key if api_key is not None else settings.aura_api_key
         self.default_sla = default_sla
         self.pricing = pricing or settings.pricing
 
@@ -449,6 +452,59 @@ class AuraClient:
         return out
 
     # ---------------------------------------------------------- explainability
+
+    async def bump_namespace(self, namespace: str) -> dict[str, Any] | None:
+        """`POST /v1/version/bump` -- retire a generation without deleting anything.
+
+        What a model redeploy should do. New requests carry the new version and miss
+        cleanly; the old generation ages out under ordinary eviction pressure. Flushing
+        instead would empty a large part of the cache at once and send the whole miss
+        stream at the origin, which is the cache causing the outage it exists to prevent.
+        """
+        if not self._breaker.allow():
+            self._counters["breaker_skips"] += 1
+            return None
+        try:
+            response = await self._http.post("/v1/version/bump", json={"namespace": namespace})
+        except Exception as exc:
+            self._note_cache_failure("version_bump", exc)
+            return None
+        self._note_cache_success()
+        if response.status_code != 200:
+            return None
+        try:
+            return dict(response.json())
+        except ValueError:
+            return None
+
+    async def identity(self) -> dict[str, Any]:
+        """What this process knows about its own connection to the cache.
+
+        The whole integration is a URL and a key, so this is the whole of what there is to
+        check -- and checking it is the difference between "the cache is doing nothing" and
+        "we never authenticated".
+        """
+        reachable = False
+        detail = ""
+        try:
+            response = await self._http.get("/healthz")
+            reachable = response.status_code == 200
+            if not reachable:
+                detail = f"engine answered {response.status_code}"
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"[:160]
+        key = self.api_key
+        return {
+            "engine": self.base_url,
+            "application": self.application,
+            # Never the key itself. A demo page that prints its own credential is a demo
+            # that leaks one the first time somebody screenshots it.
+            "key_present": bool(key),
+            "key_hint": (key[:11] + "..." if key else ""),
+            "reachable": reachable,
+            "detail": detail,
+            "breaker": self.breaker_state,
+        }
 
     async def explain(self, key: str) -> dict[str, Any] | None:
         """`GET /v1/explain/{key}` - why this object was kept, evicted or rejected."""

@@ -88,6 +88,16 @@ button {
 button:hover { border-color: var(--ink-soft); }
 button.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.conn {
+  font-size: 12.5px; padding: 9px 13px; border-radius: 8px; margin-bottom: 16px;
+  background: var(--paper); border: 1px solid var(--line); color: var(--muted);
+}
+.conn.ok { background: var(--hit-soft); border-color: #b6e0d7; color: #0f6b5c; }
+.conn.bad { background: #f7e2de; border-color: #eec4bc; color: #8c3222; }
+.conn code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.why { margin-top: 8px; font-size: 12px; color: var(--body); display: none;
+       background: var(--wash); border-radius: 6px; padding: 7px 9px; }
+.why.show { display: block; }
 """
 
 _SCRIPT = """
@@ -168,6 +178,75 @@ async function ask(url, label, el) {
 """
 
 
+_CONNECT_SCRIPT = """// The integration is a URL and a key. Showing whether both are working, before anything
+// else on the page runs, turns "the cache is not helping" into a question with an answer.
+async function checkConnection() {
+  const el = document.getElementById("conn");
+  try {
+    const res = await fetch("/connection");
+    const c = await res.json();
+    if (c.reachable && c.key_present) {
+      el.className = "conn ok";
+      el.innerHTML = "Connected to <code>" + c.engine + "</code> as <code>" + c.application +
+        "</code>, authenticated with key <code>" + c.key_hint + "</code>.";
+    } else if (c.reachable) {
+      el.className = "conn";
+      el.innerHTML = "Connected to <code>" + c.engine + "</code> as <code>" + c.application +
+        "</code>, with no API key. Fine against an engine running open; an engine running " +
+        "enforced will refuse every call. Set <code>AURA_API_KEY</code> to a key minted " +
+        "from the console.";
+    } else {
+      el.className = "conn bad";
+      el.innerHTML = "Cannot reach the cache at <code>" + c.engine + "</code>. " +
+        (c.detail || "") + " Every request below will be a rebuild.";
+    }
+  } catch (err) {
+    el.className = "conn bad";
+    el.textContent = "This application is not answering /connection: " + err.message;
+  }
+}
+
+// Why is this object in the cache, or not? The engine answers in a sentence with the
+// numbers behind it, and the page just relays it.
+async function why(id, elId) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (el.classList.contains("show")) { el.classList.remove("show"); return; }
+  el.classList.add("show");
+  el.textContent = "asking the cache...";
+  try {
+    const res = await fetch("/explain/" + id);
+    const body = await res.json();
+    const e = body.explanation || body;
+    if (!e || (!e.reasons && !e.action)) {
+      el.textContent = "The cache has no decision recorded for this object yet. Open it once.";
+      return;
+    }
+    const reasons = (e.reasons || []).join(" · ");
+    el.innerHTML = "<b>" + (e.action || "?") + "</b> - " + (e.reason_code || "") +
+      "<br>reuse in 60s: " + Math.round(100 * ((e.reuse_probability || {}).h60s || 0)) + "%" +
+      " · value density " + (e.value_density || 0).toFixed(2) +
+      " · bar " + (e.eviction_threshold || 0).toFixed(2) +
+      (reasons ? "<br>" + reasons : "");
+  } catch (err) {
+    el.textContent = "explain failed: " + err.message;
+  }
+}
+
+async function retire() {
+  try {
+    const res = await fetch("/retire", { method: "POST" });
+    const body = await res.json();
+    alert("Namespace '" + (body.namespace || "?") + "' retired to version " + (body.version || "?") +
+          ".\n\nNothing was deleted. New requests carry the new version and miss cleanly; " +
+          "the previous generation ages out under ordinary eviction pressure.");
+  } catch (err) {
+    alert("Retire failed: " + err.message);
+  }
+}
+"""
+
+
 def _shell(title: str, subtitle: str, body: str, extra_script: str) -> str:
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -180,6 +259,7 @@ def _shell(title: str, subtitle: str, body: str, extra_script: str) -> str:
   <a href="/stats">raw stats JSON</a>
 </header>
 <main>
+  <div class="conn" id="conn">checking the connection to the cache...</div>
   <div class="bar">
     <div class="stat"><div class="k">Requests</div><div class="v" id="served">0</div></div>
     <div class="stat"><div class="k">Served from cache</div><div class="v" id="hitrate">--</div></div>
@@ -199,6 +279,9 @@ def _shell(title: str, subtitle: str, body: str, extra_script: str) -> str:
 </main>
 <script>{_SCRIPT}
 {extra_script}
+
+{_CONNECT_SCRIPT}
+checkConnection();
 paintStats(); paintLog();
 </script>
 </body></html>"""
@@ -216,6 +299,10 @@ def recommendation_page(users: int) -> str:
               <h3>Shopper #{u}</h3>
               <div class="meta">segment: {_SEGMENTS[u % len(_SEGMENTS)]}</div>
               <div class="verdict" id="v{u}"></div>
+              <div class="why" id="w{u}"></div>
+              <div class="row" style="margin-top:8px">
+                <button onclick="event.stopPropagation(); why({u}, 'w{u}')">why?</button>
+              </div>
             </div>"""
         for u in (7, 42, 108, 256, 512, 1024, 2048, 4096)
     )
@@ -228,6 +315,7 @@ def recommendation_page(users: int) -> str:
     <div class="row">
       <button class="primary" onclick="browse()">Simulate 20 shoppers browsing</button>
       <button onclick="click_through(42)">Shopper #42 clicks a product</button>
+      <button onclick="retire()">Redeploy the ranking model</button>
     </div>
     <div class="hint">A click advances that shopper's epoch, which changes their cache key.
       Their old ranking is not deleted -- it simply stops being asked for, and ages out.</div>
@@ -280,6 +368,10 @@ def analytics_page(regions: int) -> str:
               <h3>{name}</h3>
               <div class="meta">{detail}</div>
               <div class="verdict" id="v{i}"></div>
+              <div class="why" id="w{i}"></div>
+              <div class="row" style="margin-top:8px">
+                <button onclick="event.stopPropagation(); why({i}, 'w{i}')">why?</button>
+              </div>
             </div>"""
         for i, (name, detail) in enumerate(
             [

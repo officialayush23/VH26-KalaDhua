@@ -246,6 +246,8 @@ class AppService:
         """The endpoints every example app must expose."""
         return [
             Route("/health", self.health, methods=["GET"]),
+            Route("/connection", self.connection_endpoint, methods=["GET"]),
+            Route("/retire", self.retire_endpoint, methods=["POST"]),
             Route("/work/{key_id}", self.work_endpoint, methods=["GET"]),
             Route("/stats", self.stats_endpoint, methods=["GET"]),
             Route("/metrics", self.metrics_endpoint, methods=["GET"]),
@@ -280,6 +282,34 @@ class AppService:
             self.log.exception("work failed", extra={"event": "work_error", "key_id": key_id})
             return JSONResponse({"error": "regeneration_failed", "detail": str(exc)}, status_code=500)
         return JSONResponse(body)
+
+    async def connection_endpoint(self, request: Request) -> JSONResponse:
+        """`GET /connection` -- am I actually plugged into the cache?
+
+        The entire integration is a base URL and a key, which means the entire set of things
+        that can be wrong with it is: wrong URL, missing key, rejected key, engine down.
+        This answers all four in one call, so "the cache is not helping" can be separated
+        from "we never reached the cache" without reading two sets of logs.
+        """
+        _ = request
+        identity = await self.client.identity()
+        identity["objects_admitted"] = int(self.client.stats().get("admitted", 0))
+        identity["objects_refused"] = int(self.client.stats().get("rejected", 0))
+        return JSONResponse(identity, status_code=200 if identity["reachable"] else 503)
+
+    async def retire_endpoint(self, request: Request) -> JSONResponse:
+        """`POST /retire` -- redeploy the model, the way it should be done.
+
+        Bumps this application's namespace. Nothing is deleted: requests after the bump
+        carry the new version and miss cleanly, while the previous generation ages out under
+        ordinary pressure. The alternative -- flushing -- turns a routine deploy into a
+        thundering herd against the origin.
+        """
+        _ = request
+        result = await self.client.bump_namespace(self.application)
+        if result is None:
+            return JSONResponse({"error": "the cache did not answer"}, status_code=502)
+        return JSONResponse(result)
 
     async def stats_endpoint(self, request: Request) -> JSONResponse:
         """`GET /stats` - contract section 7 payload plus SDK counters."""

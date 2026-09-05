@@ -69,36 +69,58 @@ services:
         destination: /index.html
 
 # ---------------------------------------------------------------------------
-# The applications, for when they should be hosted rather than run locally.
-# Each needs AURA_APPS_AURA_BASE_URL pointing at the engine's internal address and its own
-# AURA_API_KEY minted from the console. Analytics needs SUPABASE_TRANSACTION_URL, not the
-# direct one: Render containers have no IPv6 route and the direct Supabase host is IPv6
-# only.
+# The two example applications.
 #
-#  - type: web
-#    name: aura-recommendation
-#    runtime: docker
-#    dockerfilePath: ./deploy/Dockerfile.apps
-#    dockerContext: .
-#    dockerCommand: python -m recommendation.main
-#    healthCheckPath: /health
-#    envVars:
-#      - key: AURA_APPS_AURA_BASE_URL
-#        sync: false
-#      - key: AURA_API_KEY
-#        sync: false
+# Each is the same image with a different command, and each carries its own API key minted
+# from the console -- which is the point: the cache does not know what a "recommendation"
+# is, only that some caller presented a key and reported what a rebuild cost it.
 #
-#  - type: web
-#    name: aura-analytics
-#    runtime: docker
-#    dockerfilePath: ./deploy/Dockerfile.apps
-#    dockerContext: .
-#    dockerCommand: python -m analytics.main
-#    healthCheckPath: /health
-#    envVars:
-#      - key: AURA_APPS_AURA_BASE_URL
-#        sync: false
-#      - key: AURA_API_KEY
-#        sync: false
-#      - key: SUPABASE_TRANSACTION_URL
-#        sync: false
+# AURA_APPS_AURA_BASE_URL points at the engine's *internal* address on Render, so the
+# request path never leaves the private network and never pays for TLS it does not need.
+#
+# Both are optional. Running them on a laptop against the deployed engine works identically
+# and lets you start and stop traffic during a demo, which a hosted service does not.
+
+  - type: web
+    name: aura-recommendation
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile.apps
+    dockerContext: .
+    dockerCommand: python -m recommendation.main
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: AURA_APPS_AURA_BASE_URL
+        fromService:
+          name: aura-engine
+          type: web
+          property: hostport
+      # Minted in the console, pasted here once. Never in the repository.
+      - key: AURA_API_KEY
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+
+  - type: web
+    name: aura-analytics
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile.apps
+    dockerContext: .
+    dockerCommand: python -m analytics.main
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: AURA_APPS_AURA_BASE_URL
+        fromService:
+          name: aura-engine
+          type: web
+          property: hostport
+      - key: AURA_API_KEY
+        sync: false
+      # The transaction pooler, not the direct URL: Render's containers have no IPv6 route
+      # and the direct Supabase host is IPv6 only. Getting this wrong looks like the
+      # database being down.
+      - key: SUPABASE_TRANSACTION_URL
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
