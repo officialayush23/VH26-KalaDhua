@@ -497,6 +497,23 @@ class AuraClient:
 
     # ---------------------------------------------------------- explainability
 
+    async def report_l1(self) -> bool:
+        """`POST /v1/tier1` -- tell the engine what this process's own cache is doing.
+
+        The engine cannot observe L1: a request served from a local copy never reaches it,
+        so from where it sits that traffic simply does not exist. Without this report the
+        dashboard can only draw the half of the system it happens to be part of, and the
+        two-tier claim stays a claim. The payload is counters, never keys or values.
+
+        Best effort by design. A failed report costs a gap in a chart; it must not cost a
+        request, so it never raises and never opens the breaker.
+        """
+        try:
+            response = await self._http.post("/v1/tier1", json=self.l1.snapshot())
+        except Exception:
+            return False
+        return response.status_code < 300
+
     async def bump_namespace(self, namespace: str) -> dict[str, Any] | None:
         """`POST /v1/version/bump` -- retire a generation without deleting anything.
 

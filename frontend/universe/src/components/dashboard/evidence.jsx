@@ -393,6 +393,12 @@ export function EvidencePanel({ history, frame }) {
       <Panel
         title="Hit rate, both tiers"
         subtitle="L1 is the in-process cache inside each service and removes a network round trip. L2 is this engine and removes a rebuild. They are different jobs, so a single blended number would hide which one is working."
+        actions={
+          <Pill tone={(rows[rows.length - 1]?.l1Reporting ?? 0) > 0 ? "accent" : "warn"}>
+            {rows[rows.length - 1]?.l1Reporting ?? 0} process{(rows[rows.length - 1]?.l1Reporting ?? 0) === 1 ? "" : "es"} reporting L1
+          </Pill>
+        }
+        footer="L1 is measured inside the applications and posted here every five seconds, because a request served from a local copy never reaches the engine at all. With no application running, that line is honestly zero rather than quietly borrowed from something else."
       >
         <MultiLine
           series={[

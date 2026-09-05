@@ -165,6 +165,12 @@ struct App {
     /// service appears the moment it makes its first authenticated call and goes quiet on
     /// its own when it stops.
     seen: Mutex<AHashMap<String, Seen>>,
+    /// What each application's own in-process cache is doing, as that application last
+    /// reported it. The engine cannot measure this itself: a request served from a local
+    /// copy never arrives here, so from the engine's point of view that traffic does not
+    /// exist. Reported rather than inferred, and stamped so a process that has gone away
+    /// stops counting.
+    tier1: Mutex<AHashMap<String, (u64, Value)>>,
     capacity: Mutex<CapacityController>,
     leases: Mutex<Leases>,
     sim: Mutex<Option<Sim>>,
@@ -310,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
         auth: Mutex::new(auth_state),
         users: Mutex::new(user_store),
         seen: Mutex::new(AHashMap::new()),
+        tier1: Mutex::new(AHashMap::new()),
         capacity: Mutex::new(CapacityController::new(&cfg)),
         leases: Mutex::new(Leases::default()),
         sim: Mutex::new(sim),
@@ -423,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/users", get(auth_users_list).post(auth_users_create))
         .route("/v1/auth/users/:email", delete(auth_users_remove))
         .route("/v1/connections", get(connections))
+        .route("/v1/tier1", post(tier1_report))
         .route("/v1/keys", get(keys_list).post(keys_mint))
         .route("/v1/keys/:id", delete(keys_revoke))
         .route("/v1/scenarios", get(scenarios))
@@ -528,6 +536,9 @@ async fn drive(app: Shared) {
 }
 
 fn build_frame(app: &Shared) -> Value {
+    // Taken before the engine lock. Two locks held at once is how a telemetry frame turns
+    // into a deadlock the first time an application reports while a frame is being built.
+    let tier1 = tier1_summary(app);
     let probe = *app.probe.lock();
     let eng = app.engine.lock();
     let cap = app.capacity.lock();
@@ -606,7 +617,16 @@ fn build_frame(app: &Shared) -> Value {
         "sim": { "running": sim_running, "scenario": sim_scenario, "speed": sim_speed,
                  "rps": round2(rps), "base_rps": round2(base_rps) },
         "traffic": { "rps": round2(rps) },
+        // The applications' own caches, as they reported them. Separate from `layers`
+        // because it is measured somewhere else, by someone else, and saying so is the
+        // difference between telemetry and a guess.
+        "tier1": tier1,
         "layers": {
+            // Note this is the engine's *admission window*, not an application's local
+            // cache -- a small recency filter in front of the scored pool. The in-process
+            // tier is `tier1` above.
+            "admission_window": { "hits": eng.store.l1_stats.hits, "misses": eng.store.l1_stats.misses,
+                    "hit_rate": round4(eng.store.l1_stats.hit_rate()) },
             "l1": { "hits": eng.store.l1_stats.hits, "misses": eng.store.l1_stats.misses,
                     "hit_rate": round4(eng.store.l1_stats.hit_rate()) },
             "l2": { "hits": eng.store.l2_stats.hits, "misses": eng.store.l2_stats.misses,
@@ -1741,6 +1761,61 @@ async fn applications(State(app): State<Shared>) -> Json<Value> {
 /// profile was set by an operator or is still the default.
 /// Everything the console needs to show who is connected: the keys issued, whether each one
 /// has been used, when it was last seen, and what its application has actually done.
+/// `POST /v1/tier1` -- an application reporting its own cache counters.
+///
+/// Attributed to the caller's key, never to a name in the body, for the same reason every
+/// other route works that way: an application may describe its own cache, but it may not
+/// describe somebody else's. An anonymous caller on an open engine is recorded under a
+/// single shared name rather than being refused, because the local demo runs that way.
+async fn tier1_report(
+    State(app): State<Shared>,
+    caller: Option<axum::Extension<auth::Caller>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let who = match caller.as_ref().map(|axum::Extension(c)| c) {
+        Some(auth::Caller::Application { application, .. }) => application.clone(),
+        _ => "local".to_string(),
+    };
+    app.tier1.lock().insert(who.clone(), (now_epoch_ms() as u64, body));
+    Json(json!({ "recorded": who }))
+}
+
+/// Aggregate of every application's in-process cache, dropping any process that has not
+/// reported recently. Thirty seconds is six missed reports: long enough that a slow tick or
+/// a redeploy does not blink the chart, short enough that a service that died does not go
+/// on contributing to it.
+fn tier1_summary(app: &Shared) -> Value {
+    const STALE_MS: u64 = 30_000;
+    let now = now_epoch_ms() as u64;
+    let map = app.tier1.lock();
+    let mut hits = 0u64;
+    let mut misses = 0u64;
+    let mut used = 0u64;
+    let mut entries = 0u64;
+    let mut per_app = serde_json::Map::new();
+    for (name, (at, snap)) in map.iter() {
+        if now.saturating_sub(*at) > STALE_MS {
+            continue;
+        }
+        let n = |k: &str| snap.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        hits += n("hits");
+        misses += n("misses");
+        used += n("used_bytes");
+        entries += n("entries");
+        per_app.insert(name.clone(), snap.clone());
+    }
+    let total = hits + misses;
+    json!({
+        "reporting": per_app.len(),
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": if total > 0 { round4(hits as f64 / total as f64) } else { 0.0 },
+        "used_bytes": used,
+        "entries": entries,
+        "applications": Value::Object(per_app),
+    })
+}
+
 async fn connections(State(app): State<Shared>) -> Json<Value> {
     let seen = app.seen.lock().clone();
     let keys = app.auth.lock().keys();

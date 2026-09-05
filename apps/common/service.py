@@ -470,14 +470,34 @@ def build_app(service: AppService, routes: list[Route]) -> Starlette:
     `/health` than the generic one simply provides its own.
     """
 
+    async def report_tier1() -> None:
+        """Publish this process's L1 counters to the engine every few seconds.
+
+        Five seconds, not five hundred milliseconds: these are counters for a chart, not a
+        control loop, and a fleet of application processes each posting at request rate
+        would be a self-inflicted load test of the thing being measured.
+        """
+        while True:
+            try:
+                await asyncio.sleep(5.0)
+                await service.client.report_l1()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Reporting is decoration. Never let it end the loop, and never let it
+                # surface as an application error.
+                continue
+
     async def lifespan(app: Starlette):  # noqa: ANN202 - Starlette's own protocol
         service.log.info(
             "application started",
             extra={"event": "startup", "application": service.application, "aura": service.client.base_url},
         )
+        reporter = asyncio.create_task(report_tier1())
         try:
             yield
         finally:
+            reporter.cancel()
             await service.aclose()
             service.log.info("application stopped", extra={"event": "shutdown"})
 

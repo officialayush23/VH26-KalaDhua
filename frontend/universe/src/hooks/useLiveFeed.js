@@ -54,7 +54,11 @@ export function useLiveFeed() {
       const point = {
         t,
         hitRate: next?.layers?.l2?.hit_rate ?? 0,
-        hitRateL1: next?.layers?.l1?.hit_rate ?? 0,
+        // The applications' own in-process caches, as they report them. The engine cannot
+        // measure this: a request served from a local copy never reaches it.
+        hitRateL1: next?.tier1?.hit_rate ?? 0,
+        l1Reporting: next?.tier1?.reporting ?? 0,
+        admissionWindow: next?.layers?.l1?.hit_rate ?? 0,
         byteHitRate: next?.layers?.l2?.byte_hit_rate ?? 0,
         p95: next?.latency?.p95_ms ?? 0,
         p50: next?.latency?.p50_ms ?? 0,
