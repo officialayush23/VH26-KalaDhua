@@ -67,7 +67,7 @@ EXPOSE 8080
 # process dies: a cache that is up but wedged is worse than one that has crashed, because
 # nothing restarts it.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -fsS http://localhost:8080/healthz || exit 1
+  CMD curl -fsS "http://localhost:${PORT:-8080}/healthz" || exit 1
 
 # --real-values by default. The memory-scaling behaviour must be real in a deployed image;
 # the accounting-only mode exists for fast benchmark sweeps, not for anything shipped.
@@ -75,4 +75,7 @@ ENTRYPOINT ["aura"]
 # --real-values because the memory-scaling behaviour must be real in anything deployed.
 # --real-backend because the analytics application has an actual database behind it, and a
 # rebuild cost that came from a generator is not a measurement.
-CMD ["--bind", "0.0.0.0:8080", "--config", "/app/config/default.toml", "--models", "/app/models", "--real-values", "--real-backend"]
+# No --bind. listen_addr prefers the explicit flag over the platform's PORT, so passing one
+# here permanently pins the engine to 8080 and ignores whatever port the host assigned. On
+# Render that is the difference between a service the router can reach and one it cannot.
+CMD ["--config", "/app/config/default.toml", "--models", "/app/models", "--real-values", "--real-backend"]
