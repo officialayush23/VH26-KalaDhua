@@ -25,6 +25,7 @@ const RESULTS_TABLE: &str = "aura_benchmark_results";
 const EVENTS_TABLE: &str = "aura_events";
 const AUDIT_TABLE: &str = "aura_audit_log";
 const KEYS_TABLE: &str = "aura_api_keys";
+const USERS_TABLE: &str = "aura_users";
 const MODEL_BUCKET: &str = "aura-models";
 
 #[derive(Debug, Clone)]
@@ -277,6 +278,44 @@ impl Supabase {
         Ok((subject, email, exp))
     }
 
+    /// Console accounts. Password hashes only; the passwords themselves never exist outside
+    /// the browser that typed them.
+    pub async fn users(&self) -> anyhow::Result<Vec<Value>> {
+        let url = format!("{}?select=*&order=created_at.asc", self.rest(USERS_TABLE));
+        let res = self.req(self.client.get(&url)).send().await?;
+        if !res.status().is_success() {
+            anyhow::bail!("account fetch failed: {}", res.status());
+        }
+        Ok(res.json::<Vec<Value>>().await?)
+    }
+
+    /// Create or update an account, keyed on the address.
+    pub async fn upsert_user(&self, row: &Value) -> anyhow::Result<()> {
+        let res = self
+            .req(self.client.post(self.rest(USERS_TABLE)))
+            .header("Prefer", "resolution=merge-duplicates")
+            .json(&json!([row]))
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "account upsert failed: {} {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn delete_user(&self, email: &str) -> anyhow::Result<()> {
+        let url = format!("{}?email=eq.{}", self.rest(USERS_TABLE), urlencode(email));
+        let res = self.req(self.client.delete(&url)).send().await?;
+        if !res.status().is_success() {
+            anyhow::bail!("account delete failed: {}", res.status());
+        }
+        Ok(())
+    }
+
     /// Application keys, as hashes. Read once at boot so a restart does not invalidate every
     /// key an operator handed out, which on a platform that restarts containers freely would
     /// make keys useless.
@@ -470,4 +509,16 @@ mod tests {
         let day: u32 = now[8..10].parse().unwrap();
         assert!((1..=12).contains(&month) && (1..=31).contains(&day), "{now}");
     }
+}
+
+/// Minimal percent-encoding for the one place a value reaches a query string: an email
+/// address in a filter. Pulling in a URL crate for `@` and `+` would be the wrong trade.
+fn urlencode(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            other => format!("%{:02X}", other as u32),
+        })
+        .collect()
 }

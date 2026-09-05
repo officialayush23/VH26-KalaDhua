@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react"
 
 import { del, get, post } from "@/hooks/useLiveFeed"
-import { cn } from "@/lib/utils"
+import { bytes, cn, pct, usd } from "@/lib/utils"
 import { Panel, Pill } from "./primitives"
 
 /// Connecting an application to the cache.
@@ -140,6 +140,8 @@ export function OnboardingPanel({ frame }) {
         {minted && <Minted minted={minted} connected={seen.has(minted.application)} />}
       </Panel>
 
+      <ConnectedServices />
+
       <Panel
         title="Issued keys"
         subtitle="Hashes and prefixes only. The secret existed once, at mint time, and is not recoverable from here or from the database."
@@ -180,6 +182,134 @@ export function OnboardingPanel({ frame }) {
       </Panel>
     </div>
   )
+}
+
+/// Who is actually using this cache, as opposed to who was issued a credential.
+///
+/// The engine records the moment it last saw each key, so this is an observation rather
+/// than a configuration file: a service appears here when it makes its first authenticated
+/// call and falls quiet on its own when it stops.
+function ConnectedServices() {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    let alive = true
+    const load = async () => {
+      try {
+        const d = await get("/v1/connections")
+        if (alive) setData(d)
+      } catch {
+        // The panel simply stays on its last answer; the console has louder ways of
+        // saying the engine is unreachable.
+      }
+    }
+    load()
+    const id = setInterval(load, 4000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [])
+
+  const keys = data?.keys ?? []
+  const unkeyed = data?.without_a_key ?? []
+  const live = keys.filter((k) => k.connected).length
+
+  return (
+    <Panel
+      title="Connected services"
+      subtitle="Observed, not declared. A service appears the moment it makes its first authenticated call, and goes quiet on its own."
+      actions={<Pill tone={live > 0 ? "accent" : "default"}>{live} live now</Pill>}
+    >
+      {keys.length === 0 && unkeyed.length === 0 ? (
+        <p className="text-[13.5px] text-muted-foreground">
+          Nothing has called this engine yet. Mint a key above and point a service at it.
+        </p>
+      ) : (
+        <div className="space-y-2.5">
+          {keys.map((k) => (
+            <div
+              key={k.key_id}
+              className={cn(
+                "rounded-xl border px-4 py-3",
+                k.connected ? "border-primary/45 bg-primary/[0.06]" : "border-border bg-background"
+              )}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <span
+                    className={cn(
+                      "h-2 w-2 rounded-full",
+                      k.connected ? "animate-pulse bg-primary" : "bg-muted-foreground/50"
+                    )}
+                  />
+                  <span className="text-[14px] font-semibold">{k.application}</span>
+                  <code className="rounded bg-muted/50 px-1.5 py-0.5 font-mono text-[11.5px] text-muted-foreground">
+                    {k.hint}…
+                  </code>
+                  {k.revoked && <Pill tone="bad">revoked</Pill>}
+                </div>
+                <span className="text-[12.5px] text-muted-foreground">
+                  {k.last_seen_ms_ago == null
+                    ? "never used"
+                    : `last call ${humanAgo(k.last_seen_ms_ago)}`}
+                </span>
+              </div>
+              {k.traffic && (
+                <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-[12.5px] text-muted-foreground">
+                  <span>
+                    requests{" "}
+                    <span className="font-mono tabular-nums text-foreground">
+                      {Number(k.traffic.requests ?? 0).toLocaleString()}
+                    </span>
+                  </span>
+                  <span>
+                    hit rate{" "}
+                    <span className="font-mono tabular-nums text-foreground">
+                      {pct(k.traffic.hit_rate ?? 0, 1)}
+                    </span>
+                  </span>
+                  <span>
+                    holding{" "}
+                    <span className="font-mono tabular-nums text-foreground">
+                      {bytes(k.traffic.resident_bytes ?? 0)}
+                    </span>
+                  </span>
+                  <span>
+                    spent rebuilding{" "}
+                    <span className="font-mono tabular-nums text-foreground">
+                      {usd(k.traffic.cost_usd ?? 0)}
+                    </span>
+                  </span>
+                </div>
+              )}
+            </div>
+          ))}
+
+          {unkeyed.map((u) => (
+            <div key={u.application} className="rounded-xl border border-dashed border-border px-4 py-3">
+              <div className="flex items-center gap-2.5">
+                <span className="h-2 w-2 rounded-full bg-amber-400/70" />
+                <span className="text-[14px] font-semibold">{u.application}</span>
+                <span className="text-[12.5px] text-muted-foreground">
+                  calling without a key — fine on an open engine, refused once enforcement is on
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
+  )
+}
+
+function humanAgo(ms) {
+  const s = Math.round(ms / 1000)
+  if (s < 2) return "just now"
+  if (s < 60) return `${s}s ago`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m}m ago`
+  return `${Math.round(m / 60)}h ago`
 }
 
 function Minted({ minted, connected }) {

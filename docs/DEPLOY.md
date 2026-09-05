@@ -171,7 +171,9 @@ not a runtime one. Changing it means a rebuild.
 - Framework preset: Vite (detected). Build `npm run build`, output `dist`
 - Environment variables:
   - `VITE_AURA_URL=https://vh26-kaladhua.onrender.com`
-  - `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` for the sign-in form
+
+  That is the only variable the console needs. Sign-in goes to the engine, so there is no
+  second identity system to configure and nothing else to keep in step.
 
 The live socket URL is derived by swapping the scheme, so an `https` engine gives `wss`
 and there is no mixed-content block. An engine on plain `http` behind an `https` dashboard
@@ -200,32 +202,37 @@ running on the online logistic fallback, and you should not claim a trained mode
 
 ## 7. Authentication
 
-Two callers, two credentials.
+Two callers, two credentials, and the engine owns both.
+
+**People** sign in to the console with an email and a password the engine itself holds.
+There is no third-party identity provider, deliberately: a cache that can only be
+administered while some other service is reachable cannot be administered during the
+incident you most need it in. Passwords are stored as PBKDF2-HMAC-SHA256, 120,000
+iterations, per-user random salt, in `aura_users`. Sessions are twelve-hour tokens the
+engine signs, and changing a password ends every session signed under the old one.
+
+The root account comes from the environment on first boot and is written to the control
+plane, so a recycled container does not lose the only way in:
+
+```
+AURA_ROOT_EMAIL=you@example.com
+AURA_ROOT_PASSWORD=<at least 10 characters>
+```
+
+Only a root account can create or remove accounts. Apply `training/sql/008_users.sql`
+first, or accounts will not survive a restart.
 
 **Applications** carry a key: `Authorization: Bearer aura_sk_...`, minted on the console's
 Connect tab and shown exactly once. The engine stores a SHA-256 hash and so does
 `aura_api_keys`, so neither a memory dump nor a copy of the table is a working credential.
 The key is also the application's identity: the engine attributes every request under it to
-the application it was issued to and ignores any name in the request body, which is what
-makes onboarding "mint a key, point the service at the URL, watch it appear".
-
-**People** sign in through Supabase Auth in the browser. The engine verifies the token with
-`SUPABASE_JWT_KEY` (Project Settings → API → JWT Settings), HS256 only, and keeps no user
-table. An application key deliberately cannot change how the cache behaves: profiles,
-simulation and capacity need a console login, so a leaked key cannot re-tune the cache for
+the application it was issued to and ignores any name in the request body. An application
+key deliberately cannot reach a control route, so a leaked key cannot re-tune the cache for
 everyone else.
 
-**Bootstrapping.** Minting the first key needs console access, and console access needs an
-account, which is a circle on a fresh deployment. `AURA_ADMIN_TOKEN` (16 characters or more)
-breaks it: the engine accepts it as a console credential, so you can mint a key with curl or
-paste it into the console's sign-in dialog under "Operator token". It is a real credential -
-treat it as one, and remove it once real accounts exist.
-
-**Asymmetric projects.** Supabase projects created after the move to asymmetric signing keys
-issue ES256 tokens, which the project's JWT secret cannot verify. The engine handles this
-without configuration: a token it cannot check locally is checked once against
-`/auth/v1/user`, and the answer is cached until that token's own expiry, so the identity
-provider never ends up on the request path.
+`GET /v1/connections` is what the console's "Connected services" panel reads: which keys
+exist, which have been used, how long ago each was last seen, and what its application has
+actually done. It is an observation, not a registry.
 
 Mode is explicit, never inferred:
 
@@ -234,15 +241,8 @@ AURA_AUTH=open       # every route answers. Local demos.
 AURA_AUTH=enforced   # required for anything with a public address.
 ```
 
-Enforced without `SUPABASE_JWT_KEY` is a refusal to start, not a warning, because a
-deployment that silently downgrades to open is one nobody notices until it matters.
-
-Apply `training/sql/007_api_keys.sql` before enforcing, or keys will not survive a restart
-— which on a platform that recycles containers means they stop working within the hour.
-
-Set on the engine service: `AURA_AUTH=enforced`, `SUPABASE_JWT_KEY`, `SUPABASE_URL`,
-`SUPABASE_SERVICE_ROLE_SECRET_KEY`. On each application service: `AURA_API_KEY`. On the
-dashboard build: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_AURA_URL`.
+`/healthz`, `/metrics`, `/v1/auth/login` and `/v1/auth/me` stay public under enforcement -
+the way in cannot be behind the door.
 
 ## 8. Known gaps at deploy time
 - **Model bundles are not in the image.** `engine/models/` is gitignored, so a fresh

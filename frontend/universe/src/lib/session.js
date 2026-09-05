@@ -1,108 +1,114 @@
-import { createClient } from "@supabase/supabase-js"
-
-/// The console's half of authentication.
+/// The console's session, issued by the engine.
 ///
-/// People sign in through Supabase Auth in the browser; the engine verifies the token
-/// Supabase issued and keeps no user table of its own. That means there is exactly one
-/// account system, and this file never sees a password: it hands one to Supabase and holds
-/// the resulting access token.
+/// There is no third-party identity provider here and that is deliberate: a cache that can
+/// only be administered while some other service is reachable cannot be administered during
+/// the incident you most need it in. The engine owns the accounts, signs the sessions and
+/// verifies them itself, so the console needs exactly one piece of configuration -
+/// VITE_AURA_URL - and nothing else.
 ///
-/// With no Supabase project configured the module reports itself unavailable rather than
-/// throwing. A local engine runs open, and a console that refused to load without a login
-/// server would make the local demo harder for no security gain.
+/// The token lives in this browser. It is a bearer credential with a twelve-hour life, and
+/// the engine ends every session signed under a password the moment that password changes.
 
-const URL = import.meta.env.VITE_SUPABASE_URL
-const ANON = import.meta.env.VITE_SUPABASE_ANON_KEY
+const BASE = import.meta.env.VITE_AURA_URL || "http://localhost:8080"
+const STORE_KEY = "aura.session"
 
-export const authAvailable = Boolean(URL && ANON)
+let session = read()
+const listeners = new Set()
 
-export const supabase = authAvailable
-  ? createClient(URL, ANON, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
-    })
-  : null
-
-let cached = null
-
-// A deployed engine can accept an operator token as well as a login. It exists for the
-// first five minutes of a deployment's life, when there is a URL and no user yet, and it is
-// kept in this browser only: it never reaches Supabase and is never sent anywhere except
-// the engine it was issued for.
-const ADMIN_KEY = "aura.admin.token"
-
-function readAdminToken() {
+function read() {
   try {
-    return window.localStorage.getItem(ADMIN_KEY) || null
+    const raw = window.localStorage.getItem(STORE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    // An expired token is worse than none: it produces 401s that look like a broken engine.
+    if (parsed?.expires_at && parsed.expires_at * 1000 < Date.now()) return null
+    return parsed
   } catch {
-    // Private windows and blocked site data throw rather than returning null.
     return null
   }
 }
 
-let adminToken = readAdminToken()
-
-export function setAdminToken(value) {
-  adminToken = value && value.trim() ? value.trim() : null
+function write(next) {
+  session = next
   try {
-    if (adminToken) window.localStorage.setItem(ADMIN_KEY, adminToken)
-    else window.localStorage.removeItem(ADMIN_KEY)
+    if (next) window.localStorage.setItem(STORE_KEY, JSON.stringify(next))
+    else window.localStorage.removeItem(STORE_KEY)
   } catch {
-    // Not being able to persist it is survivable; it lasts the session.
+    // A browser that refuses storage still works for the length of this page view.
   }
+  listeners.forEach((fn) => fn(session))
 }
 
-export function hasAdminToken() {
-  return Boolean(adminToken)
-}
-
-/// The current access token, or null. Read synchronously by the socket and the fetch
-/// helpers, which cannot await on every call.
 export function token() {
-  return cached?.access_token ?? adminToken ?? null
+  return session?.token ?? null
 }
 
 export function currentUser() {
-  return cached?.user ?? null
+  return session?.user ?? null
 }
 
-/// Start watching the session. Returns an unsubscribe function. The callback fires once
-/// immediately with whatever is already stored, so a reload does not flash a login screen at
-/// someone who is signed in.
+export function isSignedIn() {
+  return Boolean(session?.token)
+}
+
 export function watchSession(onChange) {
-  if (!supabase) {
-    onChange(null)
-    return () => {}
-  }
-  supabase.auth.getSession().then(({ data }) => {
-    cached = data?.session ?? null
-    onChange(cached)
-  })
-  const { data } = supabase.auth.onAuthStateChange((_event, session) => {
-    cached = session ?? null
-    onChange(cached)
-  })
-  return () => data?.subscription?.unsubscribe?.()
+  listeners.add(onChange)
+  onChange(session)
+  return () => listeners.delete(onChange)
 }
 
-export async function signIn(email, password) {
-  if (!supabase) throw new Error("no Supabase project is configured for this console")
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-  if (error) throw error
-  cached = data.session
-  return data.session
-}
-
-export async function signOut() {
-  setAdminToken(null)
-  if (!supabase) return
-  await supabase.auth.signOut()
-  cached = null
-}
-
-/// Headers for a call to the engine. Absent when signed out, which is correct: an engine
-/// running open will answer anyway, and one running enforced should say so rather than be
-/// handed an empty credential.
 export function authHeaders() {
   const t = token()
   return t ? { authorization: `Bearer ${t}` } : {}
+}
+
+/// Sign in. The engine answers with one error for a wrong address and a wrong password, so
+/// this cannot be used to find out who has an account.
+export async function signIn(email, password) {
+  const res = await fetch(`${BASE}/v1/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const err = new Error(body?.error || `sign-in failed (${res.status})`)
+    err.fix = body?.fix
+    throw err
+  }
+  write({ token: body.token, expires_at: body.expires_at, user: body.user })
+  return body.user
+}
+
+export function signOut() {
+  write(null)
+}
+
+/// What the engine will accept before anything is typed: whether it is enforcing at all,
+/// and whether any account exists to sign in as. The difference matters - "wrong password"
+/// and "nobody has been created yet" are different problems with different fixes.
+export async function authState() {
+  try {
+    const res = await fetch(`${BASE}/v1/auth/me`, { headers: authHeaders() })
+    return await res.json()
+  } catch {
+    return { enforced: false, accounts_exist: true, offline: true }
+  }
+}
+
+export async function changePassword(email, currentPassword, newPassword) {
+  const res = await fetch(`${BASE}/v1/auth/password`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeaders() },
+    body: JSON.stringify({
+      email,
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body?.error || "could not change the password")
+  // Every session signed under the old password is over, including this one.
+  signOut()
+  return body
 }

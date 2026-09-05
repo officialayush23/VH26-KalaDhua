@@ -22,7 +22,7 @@ import { ProfilesPanel } from "@/components/dashboard/profiles"
 import { BaselinesPanel } from "@/components/dashboard/baselines"
 import { ArchitecturePanel } from "@/components/dashboard/architecture"
 import { OnboardingPanel } from "@/components/dashboard/onboarding"
-import { AuthNotice, SessionChip, useSession } from "@/components/dashboard/signin"
+import { AuthNotice, SessionChip, SignInScreen, useSession } from "@/components/dashboard/signin"
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
 import { FlowDiagram } from "@/components/dashboard/flowdiagram"
 
@@ -48,7 +48,7 @@ const TABS = [
 
 export function App() {
   const { frame, history, status, send, log } = useLiveFeed()
-  const { session } = useSession()
+  const { user, signedIn, enforced, accountsExist } = useSession()
   const [tab, setTab] = useState("live")
   const rootRef = useRef(null)
 
@@ -84,6 +84,12 @@ export function App() {
 
   const s = STATUS[status] ?? STATUS.connecting
 
+  // An engine that enforces and a console with no session is a login page, not a dashboard
+  // full of empty panels and a stream of 401s that reads like an outage.
+  if (enforced && !signedIn) {
+    return <SignInScreen accountsExist={accountsExist} />
+  }
+
   return (
     <div className="min-h-svh bg-background text-foreground">
       <div
@@ -112,7 +118,7 @@ export function App() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2.5">
-              <SessionChip session={session} />
+              <SessionChip user={user} signedIn={signedIn} />
               <MiniStat
                 label="Simulated time"
                 value={`${Number(frame?.virtual_time_s ?? 0).toFixed(0)}s`}
@@ -135,7 +141,7 @@ export function App() {
           <TrafficSource frame={frame} status={status} />
         </div>
 
-        <AuthNotice enforced={Boolean(frame?.auth?.enforced)} session={session} />
+        <AuthNotice enforced={Boolean(frame?.auth?.enforced)} signedIn={signedIn} />
 
         {status === "offline" && (
           <div className="mb-5 rounded-2xl border border-rose-500/30 bg-rose-500/5 p-5">

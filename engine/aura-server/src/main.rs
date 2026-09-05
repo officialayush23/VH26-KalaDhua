@@ -13,6 +13,7 @@ mod predictor;
 mod profiles;
 mod store;
 mod supabase;
+mod users;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -158,6 +159,12 @@ impl Leases {
 struct App {
     engine: Mutex<Engine>,
     auth: Mutex<auth::Auth>,
+    users: Mutex<users::Users>,
+    /// Which application key was last seen, and when. This is what makes the console's
+    /// answer to "who is using this cache" a fact rather than a configuration file: a
+    /// service appears the moment it makes its first authenticated call and goes quiet on
+    /// its own when it stops.
+    seen: Mutex<AHashMap<String, Seen>>,
     capacity: Mutex<CapacityController>,
     leases: Mutex<Leases>,
     sim: Mutex<Option<Sim>>,
@@ -168,6 +175,15 @@ struct App {
     tx: broadcast::Sender<String>,
     started: std::time::Instant,
     supabase: Option<supabase::Supabase>,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+struct Seen {
+    /// Wall clock, so the console can say "four seconds ago" without knowing the engine's
+    /// own clock.
+    last_ms: u64,
+    first_ms: u64,
+    requests: u64,
 }
 
 type Shared = Arc<App>;
@@ -273,9 +289,27 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // The root account comes from the environment on first boot and from the control plane
+    // afterwards. An engine with no accounts and enforcement on can still be reached: the
+    // login route says there is nobody to sign in as, which is a better answer than a 401
+    // that looks like a wrong password.
+    let mut user_store = users::Users::new();
+    if let (Ok(email), Ok(password)) =
+        (std::env::var("AURA_ROOT_EMAIL"), std::env::var("AURA_ROOT_PASSWORD"))
+    {
+        if password.len() < 10 {
+            anyhow::bail!("AURA_ROOT_PASSWORD must be at least 10 characters");
+        }
+        if user_store.create(&email, &password, "root").is_some() {
+            tracing::info!(%email, "root account created from the environment");
+        }
+    }
+
     let app = Arc::new(App {
         engine: Mutex::new(engine),
         auth: Mutex::new(auth_state),
+        users: Mutex::new(user_store),
+        seen: Mutex::new(AHashMap::new()),
         capacity: Mutex::new(CapacityController::new(&cfg)),
         leases: Mutex::new(Leases::default()),
         sim: Mutex::new(sim),
@@ -294,6 +328,17 @@ async fn main() -> anyhow::Result<()> {
     if app.supabase.is_some() {
         tokio::spawn(pull_models(app.clone()));
         tokio::spawn(load_keys(app.clone()));
+        tokio::spawn(load_users(app.clone()));
+    }
+    {
+        let has = !app.users.lock().is_empty();
+        app.auth.lock().set_has_accounts(has);
+        if !has {
+            tracing::warn!(
+                "no accounts exist: set AURA_ROOT_EMAIL and AURA_ROOT_PASSWORD, or apply \
+                 training/sql/008_users.sql and create one"
+            );
+        }
     }
     if args.real_backend {
         if app.supabase.is_some() {
@@ -372,6 +417,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/nodes", get(nodes))
         .route("/v1/model/reload", post(model_reload))
         .route("/v1/supabase", get(supabase_status))
+        .route("/v1/auth/login", post(auth_login))
+        .route("/v1/auth/me", get(auth_me))
+        .route("/v1/auth/password", post(auth_password))
+        .route("/v1/auth/users", get(auth_users_list).post(auth_users_create))
+        .route("/v1/auth/users/:email", delete(auth_users_remove))
+        .route("/v1/connections", get(connections))
         .route("/v1/keys", get(keys_list).post(keys_mint))
         .route("/v1/keys/:id", delete(keys_revoke))
         .route("/v1/scenarios", get(scenarios))
@@ -635,7 +686,7 @@ fn build_frame(app: &Shared) -> Value {
         },
         "auth": {
             "enforced": app.auth.lock().is_enforced(),
-            "admin_token_accepted": app.auth.lock().has_admin_token()
+            "accounts_exist": app.auth.lock().has_accounts()
         },
         "fidelity": {
             // Where the requests came from, not what we wish they came from. The generator
@@ -718,6 +769,16 @@ async fn gate(
 
     // The lock is taken, the decision is made, and the lock is dropped before anything can
     // await. A mutex held across a network call is how a cache stops answering.
+    // A session this engine issued is the ordinary case, so it is checked first and never
+    // leaves the process.
+    if let Some(token) = bearer.as_deref() {
+        let own = app.users.lock().verify(token);
+        if let Some((subject, email)) = own {
+            req.extensions_mut().insert(auth::Caller::Person { subject, email });
+            return next.run(req).await;
+        }
+    }
+
     let verdict = app.auth.lock().authorise(need, bearer.as_deref());
     let verdict = match verdict {
         auth::Verdict::Remote(token) => match app.supabase.as_ref() {
@@ -736,6 +797,16 @@ async fn gate(
 
     match verdict {
         Ok(caller) => {
+            if let auth::Caller::Application { application, .. } = &caller {
+                let now = now_epoch_ms() as u64;
+                let mut seen = app.seen.lock();
+                let entry = seen.entry(application.clone()).or_insert(Seen {
+                    first_ms: now,
+                    ..Default::default()
+                });
+                entry.last_ms = now;
+                entry.requests += 1;
+            }
             req.extensions_mut().insert(caller);
             next.run(req).await
         }
@@ -744,6 +815,248 @@ async fn gate(
             Json(json!({ "error": denial.message(), "path": path })),
         )
             .into_response(),
+    }
+}
+
+
+#[derive(Deserialize)]
+struct LoginBody {
+    email: String,
+    password: String,
+}
+
+/// Sign in. One error for a wrong address and a wrong password, because telling them apart
+/// turns this route into a list of who has an account here.
+async fn auth_login(State(app): State<Shared>, Json(body): Json<LoginBody>) -> impl IntoResponse {
+    let result = app.users.lock().login(&body.email, &body.password);
+    match result {
+        Ok((token, user, exp)) => {
+            let now = { app.engine.lock().now_ms };
+            app.engine.lock().audit.record(
+                now,
+                audit::AuditKind::ModelLoad,
+                audit::Severity::Notice,
+                &user.email,
+                "console",
+                format!("{} signed in to the console.", user.email),
+                vec![audit::Fact::new("role", user.role.clone())],
+                0.0,
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "token": token,
+                    "expires_at": exp,
+                    "user": { "email": user.email, "role": user.role, "id": user.id }
+                })),
+            )
+                .into_response()
+        }
+        Err(users::LoginError::NoAccounts) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "this engine has no accounts yet",
+                "fix": "set AURA_ROOT_EMAIL and AURA_ROOT_PASSWORD on the service and restart it"
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "that email and password do not match an account here" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_me(
+    State(app): State<Shared>,
+    caller: Option<axum::Extension<auth::Caller>>,
+) -> Json<Value> {
+    let who = caller.as_ref().map(|axum::Extension(c)| c.label());
+    Json(json!({
+        "signed_in": who.is_some(),
+        "who": who,
+        "accounts_exist": !app.users.lock().is_empty(),
+        "enforced": app.auth.lock().is_enforced(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    email: String,
+    current_password: String,
+    new_password: String,
+}
+
+/// Change a password by presenting the current one. Changing the root password ends every
+/// session signed under the old one, which is what changing a password is for.
+async fn auth_password(
+    State(app): State<Shared>,
+    Json(body): Json<PasswordBody>,
+) -> impl IntoResponse {
+    if body.new_password.len() < 10 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "a password needs at least 10 characters" })),
+        )
+            .into_response();
+    }
+    let ok = {
+        let mut users = app.users.lock();
+        match users.login(&body.email, &body.current_password) {
+            Ok(_) => users.set_password(&body.email, &body.new_password),
+            Err(_) => false,
+        }
+    };
+    if !ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "that email and password do not match an account here" })),
+        )
+            .into_response();
+    }
+    // The row is taken while the lock is held and written after it is dropped: a guard
+    // across an await would make this future unsendable, and holding a lock across a network
+    // call would stall every request behind it.
+    let row = app.users.lock().get(&body.email).map(|u| u.as_row());
+    if let (Some(sb), Some(row)) = (app.supabase.as_ref(), row) {
+        if let Err(e) = sb.upsert_user(&row).await {
+            tracing::warn!("password changed here but not persisted ({e})");
+        }
+    }
+    (StatusCode::OK, Json(json!({ "changed": true, "sessions_invalidated": true }))).into_response()
+}
+
+async fn auth_users_list(State(app): State<Shared>) -> Json<Value> {
+    Json(json!({ "users": app.users.lock().list() }))
+}
+
+#[derive(Deserialize)]
+struct CreateUserBody {
+    email: String,
+    password: String,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// Whether the presented session belongs to a root account. Creating and removing accounts
+/// is root's alone: an operator who can mint themselves a colleague has root by another
+/// name.
+fn is_root(app: &Shared, headers: &axum::http::HeaderMap) -> bool {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match token {
+        Some(t) => app.users.lock().role_of_token(t).as_deref() == Some("root"),
+        // An engine running open has no sessions to check, and locking account management
+        // behind a credential nobody has to present would only be theatre.
+        None => !app.auth.lock().is_enforced(),
+    }
+}
+
+async fn auth_users_remove(
+    State(app): State<Shared>,
+    headers: axum::http::HeaderMap,
+    Path(email): Path<String>,
+) -> impl IntoResponse {
+    if !is_root(&app, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "only a root account can remove accounts" })),
+        )
+            .into_response();
+    }
+    let removed = app.users.lock().remove(&email);
+    if !removed {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "no such account, or it is the last root account, which cannot be \
+                          removed because an engine nobody can administer is worse"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(sb) = app.supabase.as_ref() {
+        if let Err(e) = sb.delete_user(&email).await {
+            tracing::warn!("account {email} removed here but not in the control plane ({e})");
+        }
+    }
+    (StatusCode::OK, Json(json!({ "removed": email }))).into_response()
+}
+
+async fn auth_users_create(
+    State(app): State<Shared>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CreateUserBody>,
+) -> impl IntoResponse {
+    if !is_root(&app, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "only a root account can create accounts" })),
+        )
+            .into_response();
+    }
+    if body.password.len() < 10 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "a password needs at least 10 characters" })),
+        )
+            .into_response();
+    }
+    let role = body.role.unwrap_or_else(|| "operator".to_string());
+    let created = app.users.lock().create(&body.email, &body.password, &role);
+    match created {
+        Some(user) => {
+            if let Some(sb) = app.supabase.as_ref() {
+                if let Err(e) = sb.upsert_user(&user.as_row()).await {
+                    tracing::warn!("account {} not persisted ({e})", user.email);
+                }
+            }
+            app.auth.lock().set_has_accounts(true);
+            (StatusCode::CREATED, Json(json!({ "user": user }))).into_response()
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "that address is not usable or already has an account" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Adopt the accounts created in earlier runs.
+async fn load_users(app: Shared) {
+    let Some(sb) = app.supabase.as_ref() else { return };
+    match sb.users().await {
+        Ok(rows) => {
+            let found: Vec<users::User> = rows.iter().filter_map(users::User::from_row).collect();
+            let n = found.len();
+            {
+                let mut store = app.users.lock();
+                store.adopt(found);
+                app.auth.lock().set_has_accounts(!store.is_empty());
+            }
+            if n > 0 {
+                tracing::info!("adopted {n} console accounts from the control plane");
+            }
+            // A root account created from the environment on this boot has to be written
+            // back, or it exists only until the container is recycled.
+            let root_row = app
+                .users
+                .lock()
+                .list()
+                .into_iter()
+                .find(|u| u.role == "root")
+                .map(|u| u.as_row());
+            if let Some(row) = root_row {
+                let _ = sb.upsert_user(&row).await;
+            }
+        }
+        Err(e) => tracing::warn!(
+            "could not read console accounts ({e}); apply training/sql/008_users.sql if the \
+             table is missing"
+        ),
     }
 }
 
@@ -1408,6 +1721,69 @@ async fn applications(State(app): State<Shared>) -> Json<Value> {
 
 /// Every application the cache has seen, with the profile in force for it and whether that
 /// profile was set by an operator or is still the default.
+/// Everything the console needs to show who is connected: the keys issued, whether each one
+/// has been used, when it was last seen, and what its application has actually done.
+async fn connections(State(app): State<Shared>) -> Json<Value> {
+    let seen = app.seen.lock().clone();
+    let keys = app.auth.lock().keys();
+    let now = now_epoch_ms() as u64;
+    let (apps, per_app) = {
+        let eng = app.engine.lock();
+        let per_app: AHashMap<String, Value> = eng
+            .apps
+            .iter()
+            .map(|(name, st)| {
+                (
+                    name.clone(),
+                    json!({
+                        "requests": st.requests,
+                        "hit_rate": round4(if st.requests > 0 {
+                            st.hits as f64 / st.requests as f64
+                        } else {
+                            0.0
+                        }),
+                        "cost_usd": round4(st.cost_usd),
+                        "resident_bytes": *eng.resident_bytes.get(name).unwrap_or(&0),
+                    }),
+                )
+            })
+            .collect();
+        (eng.apps.keys().cloned().collect::<Vec<_>>(), per_app)
+    };
+
+    let rows: Vec<Value> = keys
+        .iter()
+        .map(|k| {
+            let s = seen.get(&k.application).copied();
+            json!({
+                "key_id": k.id,
+                "application": k.application,
+                "hint": k.hint,
+                "revoked": k.revoked,
+                "connected": s.map(|v| now.saturating_sub(v.last_ms) < 60_000).unwrap_or(false),
+                "last_seen_ms_ago": s.map(|v| now.saturating_sub(v.last_ms)),
+                "requests_on_key": s.map(|v| v.requests).unwrap_or(0),
+                "traffic": per_app.get(&k.application).cloned(),
+            })
+        })
+        .collect();
+
+    // Applications the engine has served that hold no key of their own: the local demo, or
+    // anything talking to an engine running open. Saying so is better than implying every
+    // caller was issued a credential.
+    let unkeyed: Vec<Value> = apps
+        .iter()
+        .filter(|name| !keys.iter().any(|k| &k.application == *name))
+        .map(|name| json!({ "application": name, "traffic": per_app.get(name).cloned() }))
+        .collect();
+
+    Json(json!({
+        "enforced": app.auth.lock().is_enforced(),
+        "keys": rows,
+        "without_a_key": unkeyed,
+    }))
+}
+
 async fn profiles_all(State(app): State<Shared>) -> Json<Value> {
     let eng = app.engine.lock();
     let cap = eng.store.capacity_bytes().max(1);

@@ -146,10 +146,10 @@ pub enum Verdict {
 pub struct Auth {
     pub mode: Mode,
     jwt_secret: Option<String>,
-    /// A token that grants console access without an identity provider. It exists for the
-    /// first five minutes of a deployment's life, when there is a URL and no way to sign in
-    /// yet, and for automation that should not hold a person's login.
-    admin_token: Option<String>,
+    /// Sessions the engine issued itself are checked against [`crate::users::Users`], which
+    /// the gate holds separately; this flag only records that accounts exist at all, so the
+    /// console can tell "sign in" from "there is nobody to sign in as yet".
+    has_accounts: bool,
     keys: AHashMap<String, ApiKey>,
     /// Tokens already checked with the provider, with the expiry the provider stated. A
     /// remote check per request would put the identity provider on the cache's hot path,
@@ -172,20 +172,10 @@ impl Auth {
             .or_else(|_| std::env::var("SUPABASE_JWT_SECRET"))
             .ok()
             .filter(|s| !s.trim().is_empty());
-        let admin_token = std::env::var("AURA_ADMIN_TOKEN")
-            .ok()
-            .filter(|s| s.trim().len() >= 16);
-        if mode == Mode::Enforced && jwt_secret.is_none() && admin_token.is_none() {
-            anyhow::bail!(
-                "AURA_AUTH=enforced needs SUPABASE_JWT_KEY or AURA_ADMIN_TOKEN (16+ chars) \
-                 so somebody can actually sign in; refusing to start rather than accepting \
-                 everyone"
-            );
-        }
         Ok(Self {
             mode,
             jwt_secret,
-            admin_token,
+            has_accounts: false,
             keys: AHashMap::new(),
             verified: AHashMap::new(),
         })
@@ -195,8 +185,12 @@ impl Auth {
         self.mode == Mode::Enforced
     }
 
-    pub fn has_admin_token(&self) -> bool {
-        self.admin_token.is_some()
+    pub fn has_accounts(&self) -> bool {
+        self.has_accounts
+    }
+
+    pub fn set_has_accounts(&mut self, yes: bool) {
+        self.has_accounts = yes;
     }
 
     /// Record a token the identity provider vouched for, so the next request on it is
@@ -269,18 +263,6 @@ impl Auth {
             };
         };
 
-        // Constant-time-ish comparison is not the concern here - the token is compared once
-        // per request against a value of the operator's own choosing - but length is checked
-        // at load so a blank environment variable cannot become a valid credential.
-        if let Some(admin) = &self.admin_token {
-            if token == admin {
-                return Verdict::Allowed(Caller::Person {
-                    subject: "admin-token".to_string(),
-                    email: None,
-                });
-            }
-        }
-
         if let Some((exp, subject, email)) = self.verified.get(&hash_secret(token)) {
             if *exp > now_secs() {
                 return Verdict::Allowed(Caller::Person {
@@ -309,6 +291,8 @@ impl Auth {
             };
         }
 
+        // A session this engine signed is the normal case and is checked by the caller
+        // before this point; reaching here with one means it did not verify.
         match &self.jwt_secret {
             Some(secret) => match verify_jwt(token, secret) {
                 Ok(caller) => Verdict::Allowed(caller),
@@ -318,7 +302,8 @@ impl Auth {
                 Err(Denial::Malformed) => Verdict::Remote(token.to_string()),
                 Err(d) => Verdict::Denied(d),
             },
-            None if self.is_enforced() => Verdict::Remote(token.to_string()),
+            // No external provider configured: an unrecognised token is simply wrong.
+            None if self.is_enforced() => Verdict::Denied(Denial::Expired),
             None => Verdict::Allowed(Caller::Anonymous),
         }
     }
@@ -361,6 +346,13 @@ impl Denial {
 /// strictest class, instead of silently becoming public.
 pub fn need_for(method: &str, path: &str) -> Need {
     if path == "/healthz" || path == "/metrics" {
+        return Need::Public;
+    }
+    // The way in cannot be behind the door. `/v1/auth/login` takes an email and a password
+    // and is the only route that mints a session, so gating it means nobody can ever sign
+    // in; `/v1/auth/me` reports whether accounts exist at all, which is what the console
+    // needs to tell "sign in" from "there is nobody to sign in as yet".
+    if path == "/v1/auth/login" || path == "/v1/auth/me" {
         return Need::Public;
     }
     if path.starts_with("/v1/cache")
