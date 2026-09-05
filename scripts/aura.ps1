@@ -28,6 +28,9 @@
 #>
 
 $script:AuraUrl = if ($env:AURA_URL) { $env:AURA_URL } else { "http://localhost:8080" }
+# Set by Connect-Aura. An engine running open ignores it; one running enforced refuses
+# every route without it.
+$script:AuraToken = $env:AURA_TOKEN
 
 function Set-AuraUrl {
     <#  Point every command at a different engine, e.g. a Railway deployment. #>
@@ -54,12 +57,14 @@ function Invoke-Aura {
         $Body = $null
     )
     $uri = "$script:AuraUrl$Path"
+    $headers = @{}
+    if ($script:AuraToken) { $headers['Authorization'] = "Bearer $script:AuraToken" }
     try {
         if ($null -ne $Body) {
             $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 10 -Compress }
-            return Invoke-RestMethod -Method $Method -Uri $uri -ContentType 'application/json' -Body $json -TimeoutSec 300
+            return Invoke-RestMethod -Method $Method -Uri $uri -ContentType 'application/json' -Body $json -Headers $headers -TimeoutSec 300
         }
-        return Invoke-RestMethod -Method $Method -Uri $uri -TimeoutSec 300
+        return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -TimeoutSec 300
     }
     catch {
         # PowerShell 7 puts the body in ErrorDetails; 5.1 makes you read the stream.
@@ -82,6 +87,75 @@ function Invoke-Aura {
         }
         return $null
     }
+}
+
+# ----------------------------------------------------------------- accounts and keys
+
+function Connect-Aura {
+    <#
+        Sign in and keep the session for the rest of this shell.
+
+        The console is one way in and this is the other. Neither is privileged over the
+        other - both call POST /v1/auth/login and get the same token back - which matters
+        because a browser that will not render is not a reason to be locked out of your own
+        engine.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Email,
+        [Parameter(Mandatory)][string]$Password
+    )
+    $result = Invoke-Aura -Path '/v1/auth/login' -Method Post -Body @{ email = $Email; password = $Password }
+    if ($null -eq $result -or -not $result.token) {
+        Write-Host "sign-in failed" -ForegroundColor Red
+        return
+    }
+    $script:AuraToken = $result.token
+    Write-Host "signed in as $($result.user.email) ($($result.user.role))" -ForegroundColor Green
+    Write-Host "  the session is held in this shell only; nothing is written to disk" -ForegroundColor DarkGray
+}
+
+function Get-AuraKeys {
+    <# Every application key this engine has issued. The secrets are not stored anywhere. #>
+    $result = Invoke-Aura -Path '/v1/keys'
+    if ($null -eq $result) { return }
+    $keys = if ($result.keys) { $result.keys } else { $result }
+    if (-not $keys) { Write-Host "no keys issued yet" -ForegroundColor DarkGray; return }
+    $keys | Format-Table @{L='id';E={$_.id}},
+                         @{L='application';E={$_.application}},
+                         @{L='hint';E={$_.hint}},
+                         @{L='revoked';E={$_.revoked}} -AutoSize | Out-Host
+}
+
+function New-AuraKey {
+    <#
+        Mint an application key.
+
+        The key IS the application's identity: whatever name it is issued to is the
+        application every request under it belongs to. That is what makes onboarding a
+        matter of pointing a service at a URL rather than registering anything.
+
+        Shown exactly once. The engine stores only a SHA-256 of it, so a leak of the
+        engine's state does not leak the key - and neither this shell nor the console can
+        show it to you again.
+    #>
+    param([Parameter(Mandatory)][string]$Application)
+    $result = Invoke-Aura -Path '/v1/keys' -Method Post -Body @{ application = $Application }
+    if ($null -eq $result) { return }
+    if ($result.error) { Write-Host "refused: $($result.error)" -ForegroundColor Red; return }
+
+    Write-Host ""
+    Write-Host "  $($result.secret)" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Shown once. Point the service at the engine with:" -ForegroundColor Cyan
+    Write-Host "  `$env:AURA_API_KEY = `"$($result.secret)`"" -ForegroundColor Gray
+    Write-Host "  `$env:AURA_APPS_AURA_BASE_URL = `"$script:AuraUrl`"" -ForegroundColor Gray
+    return $result
+}
+
+function Revoke-AuraKey {
+    <# Stop a key working. The objects it admitted stay; only the credential dies. #>
+    param([Parameter(Mandatory)][string]$Id)
+    Invoke-Aura -Path "/v1/keys/$([uri]::EscapeDataString($Id))" -Method Delete
 }
 
 # ----------------------------------------------------------------- health and state
@@ -376,4 +450,5 @@ function Show-Aura {
 }
 
 Write-Host "AURA commands loaded. Endpoint: $script:AuraUrl" -ForegroundColor Cyan
-Write-Host "  Show-Aura   Invoke-AuraBenchSuite   Get-AuraAudit   Get-AuraConsistency   Invoke-AuraReload" -ForegroundColor DarkGray
+Write-Host "  Show-Aura   Invoke-AuraBenchSuite   Get-AuraAudit   Get-AuraConsistency" -ForegroundColor DarkGray
+Write-Host "  Connect-Aura   New-AuraKey   Get-AuraKeys   Revoke-AuraKey" -ForegroundColor DarkGray
