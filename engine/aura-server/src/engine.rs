@@ -1326,10 +1326,25 @@ impl Engine {
         evicted: usize,
     ) {
         let name = format!("{}:{}", ctx.application, key);
+        // The density is a ratio of four things and the sentence only quotes two of them.
+        // When a large object with a high reuse probability is refused, the question is
+        // always which term sank it, and answering that from a screenshot beats guessing:
+        // value is what the object is worth over the horizons, rent is what holding it
+        // costs for a minute, and density is the first divided by the second.
+        let profile = *self.profiles.get(&ctx.application);
+        let w = profile.horizon_weights;
+        let expected_reuses = reuse[0] * w[0] * 6.0 + reuse[1] * w[1] * 2.0 + reuse[2] * w[2];
+        let rent = self
+            .cfg
+            .pricing
+            .holding_cost_usd(ctx.size_bytes as f64, 60_000.0)
+            .max(1e-12);
         let facts = vec![
             Fact::new("size", audit::bytes(ctx.size_bytes)),
             Fact::new("reuse_60s", audit::percent(reuse[1])),
+            Fact::new("expected_reuses", format!("{expected_reuses:.2}")),
             Fact::new("rebuild_cost", audit::usd(cost_usd)),
+            Fact::new("rent_per_min", audit::usd(rent)),
             Fact::new("value_density", format!("{density:.2}")),
             Fact::new("bar", format!("{threshold:.2}")),
         ];

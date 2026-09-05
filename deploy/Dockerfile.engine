@@ -5,7 +5,12 @@
 # keeps it small enough to redeploy in seconds and leaves nothing to audit.
 
 # ---------------------------------------------------------------- build
-FROM rust:1.83-slim-bookworm AS build
+# Tracks the latest stable 1.x rather than a pinned patch. A pinned old toolchain is not
+# reproducibility, it is a time bomb: 1.83 predates the stabilisation of edition 2024, and a
+# transitive dependency adopting it broke the build with an error about a Cargo feature
+# rather than about anything in this repository. Cargo.lock is what pins the dependency
+# versions; the compiler only has to be new enough to read them.
+FROM rust:1-slim-bookworm AS build
 
 WORKDIR /build
 
