@@ -23,6 +23,7 @@ export function useLiveFeed() {
   const socketRef = useRef(null)
   const retryRef = useRef(null)
   const pollRef = useRef(null)
+  const attemptsRef = useRef(0)
 
   const record = useCallback((next) => {
     setFrame(next)
@@ -71,16 +72,23 @@ export function useLiveFeed() {
 
   const startPolling = useCallback(() => {
     if (pollRef.current) return
-    pollRef.current = setInterval(async () => {
+    const tick = async () => {
       try {
         const res = await fetch(`${API}/v1/stats`, { headers: authHeaders() })
         if (!res.ok) throw new Error(String(res.status))
         record(await res.json())
+        // Polling is a working state, not a failure. Saying so is the difference between
+        // a console that looks broken while showing correct numbers and one that tells the
+        // truth about how it got them.
         setStatus("polling")
       } catch {
         setStatus("offline")
       }
-    }, 1000)
+    }
+    // Fire immediately, then on the interval: waiting a full second before the first
+    // request means a second of "offline" every time the socket drops.
+    tick()
+    pollRef.current = setInterval(tick, 1000)
   }, [record])
 
   useEffect(() => {
@@ -101,6 +109,7 @@ export function useLiveFeed() {
       socketRef.current = socket
 
       socket.onopen = () => {
+        attemptsRef.current = 0
         stopPolling()
         setStatus("live")
       }
@@ -114,9 +123,22 @@ export function useLiveFeed() {
       socket.onerror = () => startPolling()
       socket.onclose = () => {
         if (closed) return
-        setStatus("reconnecting")
+        attemptsRef.current += 1
+        // Do NOT declare "reconnecting" here. Polling has already been started and is
+        // setting the status from what it actually observes; overwriting it on every
+        // failed handshake is what pinned the header to "reconnecting" while correct data
+        // was arriving underneath it every second.
         startPolling()
-        retryRef.current = setTimeout(connect, 2000)
+
+        // Exponential backoff with jitter, capped. A socket that is being refused for a
+        // structural reason -- a proxy that will not upgrade, a plan that does not carry
+        // WebSockets -- is not going to succeed on the next attempt either, and retrying
+        // every two seconds forever only fills the console with noise. After the backoff
+        // saturates we still try occasionally, because the reason may be transient.
+        const n = Math.min(attemptsRef.current, 6)
+        const base = Math.min(2000 * 2 ** (n - 1), 60_000)
+        const delay = base + Math.random() * base * 0.3
+        retryRef.current = setTimeout(connect, delay)
       }
     }
 

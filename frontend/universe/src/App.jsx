@@ -26,12 +26,20 @@ import { AuthNotice, SessionChip, SignInScreen, useSession } from "@/components/
 import { Pipeline, TrafficSource } from "@/components/dashboard/pipeline"
 import { FlowDiagram } from "@/components/dashboard/flowdiagram"
 
+// Four honest states, and no state that says "trying" while correct data is arriving.
+// `polling` is a working connection: the socket could not be established, so the console
+// asks for the same snapshot once a second instead. Everything on the page is real; only
+// the transport is second-best. Saying "reconnecting" there made a working console look
+// broken, which is worse than either being live or being plainly offline.
 const STATUS = {
-  live: { tone: "bg-primary", label: "live" },
-  polling: { tone: "bg-amber-400", label: "polling" },
-  reconnecting: { tone: "bg-amber-400", label: "reconnecting" },
-  connecting: { tone: "bg-muted-foreground", label: "connecting" },
-  offline: { tone: "bg-rose-400", label: "engine offline" },
+  live: { tone: "bg-primary", label: "live", hint: "streaming over the telemetry socket" },
+  polling: {
+    tone: "bg-amber-400",
+    label: "live · polling",
+    hint: "the socket could not be established, so the console is fetching a snapshot every second",
+  },
+  connecting: { tone: "bg-muted-foreground", label: "connecting", hint: "opening the telemetry socket" },
+  offline: { tone: "bg-rose-400", label: "engine offline", hint: "the engine did not answer" },
 }
 
 const TABS = [
@@ -105,7 +113,10 @@ export function App() {
                 <h1 className="text-[30px] font-semibold leading-none tracking-tight">
                   AURA
                 </h1>
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium">
+                <span
+                  title={s.hint}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium"
+                >
                   <span className={cn("h-1.5 w-1.5 rounded-full", s.tone)} />
                   {s.label}
                 </span>
