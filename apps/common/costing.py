@@ -81,6 +81,22 @@ class ObjectContext(BaseModel):
     sla_class: SlaClass = "normal"
     regen: CostVector = Field(default_factory=CostVector)
 
+    # What this object was derived from, as free-form tags the application chooses:
+    # ``row:product:1292``, ``table:orders``, ``tenant:acme``.
+    #
+    # The cache never interprets a tag. It records the edge, so that when the database says
+    # "this row changed" it can name every object built from it without knowing what any of
+    # them are. Without this the only way to stay correct after a write is a short TTL,
+    # which pays for staleness on every object all the time instead of paying for accuracy
+    # once, when something actually changes.
+    depends_on: list[str] = Field(default_factory=list)
+
+    # The generation this object belongs to. Bumping a namespace retires everything in it
+    # without deleting anything, which is how a model redeploy is handled: the old
+    # generation ages out under ordinary pressure instead of the whole miss stream
+    # arriving at the origin at once.
+    namespace: str | None = None
+
 
 class CostMeter:
     """Measures one regeneration.

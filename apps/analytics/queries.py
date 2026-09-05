@@ -353,10 +353,44 @@ class QueryPlan:
     params_sqlite: tuple[Any, ...]
     cache_key: str
     label: str
+    # What this result was computed from. The cache stores the edges and never reads them;
+    # they exist so that a write in Postgres can name every rollup built from the changed
+    # row without anyone maintaining a list of which rollups those are.
+    #
+    # A region-scoped query depends on that one region; an all-regions query depends on
+    # every one of them, which is correct and is also why those objects are the expensive
+    # ones to invalidate. Getting this wrong in the safe direction -- tagging too broadly --
+    # costs rebuilds; getting it wrong the other way serves stale numbers, so where there is
+    # doubt the wider tag is the right one.
+    tags: tuple[str, ...] = ()
 
     def params_for(self, dialect: str) -> Sequence[Any]:
         """Bound parameters for the active dialect."""
         return self.params_postgres if dialect == "postgres" else self.params_sqlite
+
+
+# Which base tables each query reads. Written down once here rather than parsed out of the
+# SQL, because a tag that silently stops matching the query it describes is worse than no
+# tag at all: it reports work it did not do.
+_QUERY_TABLES: dict[str, tuple[str, ...]] = {
+    "revenue_by_region": ("app_orders", "app_order_lines", "app_products", "app_regions"),
+    "top_products": ("app_orders", "app_order_lines", "app_products"),
+    "daily_trend": ("app_orders", "app_order_lines"),
+    "category_matrix": ("app_orders", "app_order_lines", "app_products", "app_regions"),
+    "cohort_retention": ("app_orders", "app_customers"),
+}
+
+
+def tags_for(name: str, region_id: int | None) -> tuple[str, ...]:
+    """Dependency tags for one query, in the vocabulary the database triggers emit."""
+    tags = [f"table:{t}" for t in _QUERY_TABLES.get(name, ("app_orders",))]
+    if region_id is None:
+        # An all-regions rollup is downstream of every region, so a change to any one of
+        # them invalidates it. Enumerating them is what makes that true rather than hoped.
+        tags.extend(f"row:region:{i}" for i in range(1, REGION_COUNT + 1))
+    else:
+        tags.append(f"row:region:{region_id}")
+    return tuple(tags)
 
 
 def plan_for(key_id: int, *, expensive: bool, limit: int) -> QueryPlan:
@@ -372,6 +406,7 @@ def plan_for(key_id: int, *, expensive: bool, limit: int) -> QueryPlan:
             params_sqlite=(limit,),
             cache_key=f"analytics:{EXPENSIVE}:all:limit{limit}",
             label=f"{EXPENSIVE}(all-time)",
+            tags=tags_for(EXPENSIVE, None),
         )
 
     name = _ROTATION[key_id % len(_ROTATION)]
@@ -386,6 +421,7 @@ def plan_for(key_id: int, *, expensive: bool, limit: int) -> QueryPlan:
             params_sqlite=(sqlite_window, limit),
             cache_key=f"analytics:{name}:all:{days}d:limit{limit}",
             label=f"{name}(all regions, {days}d)",
+            tags=tags_for(name, None),
         )
     if name == "category_matrix":
         return QueryPlan(
@@ -394,6 +430,7 @@ def plan_for(key_id: int, *, expensive: bool, limit: int) -> QueryPlan:
             params_sqlite=(sqlite_window, limit),
             cache_key=f"analytics:{name}:all:{days}d:limit{limit}",
             label=f"{name}(all regions, {days}d)",
+            tags=tags_for(name, None),
         )
     return QueryPlan(
         query=QUERIES[name],
@@ -401,6 +438,7 @@ def plan_for(key_id: int, *, expensive: bool, limit: int) -> QueryPlan:
         params_sqlite=(region_id, sqlite_window, limit),
         cache_key=f"analytics:{name}:region{region_id}:{days}d:limit{limit}",
         label=f"{name}(region {region_id}, {days}d)",
+        tags=tags_for(name, region_id),
     )
 
 

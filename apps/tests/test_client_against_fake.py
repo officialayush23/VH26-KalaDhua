@@ -346,3 +346,65 @@ def _closed_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+# --------------------------------------------------------------------- dependency tags
+
+
+def test_declared_dependencies_travel_with_the_admission(server: Any) -> None:
+    """The tags an application declares must arrive on the PUT.
+
+    This is the whole of the invalidation story from the application's side. If the tags do
+    not reach the cache, `POST /v1/invalidate` has nothing to match, and a price change in
+    the database silently leaves every rollup built from it in place -- which is
+    indistinguishable from a working cache right up until someone reads a stale number.
+    """
+
+    async def scenario() -> None:
+        async def regen(meter: CostMeter) -> dict[str, Any]:
+            meter.add_db_ms(20.0)
+            return {"rows": []}
+
+        async with AuraClient(server.base_url, application="analytics") as client:
+            await client.get_or_regen(
+                "analytics:revenue:region7:30d",
+                object_type="dashboard_query",
+                ttl_ms=600_000,
+                regen=regen,
+                depends_on=["row:region:7", "table:app_orders"],
+                namespace="analytics",
+            )
+
+    server.fake.admit = True
+    server.fake.puts.clear()
+    run(scenario())
+
+    assert server.fake.puts, "the miss was never written back to the cache"
+    context = server.fake.puts[-1]["context"]
+    assert context["depends_on"] == ["row:region:7", "table:app_orders"]
+    assert context["namespace"] == "analytics"
+
+
+def test_an_object_without_declared_dependencies_still_admits(server: Any) -> None:
+    """Tags are optional.
+
+    An application that does not know what it depends on is not obliged to invent an
+    answer; it gets TTL-only correctness, which is what every cache offers by default.
+    """
+
+    async def scenario() -> None:
+        async with AuraClient(server.base_url, application="content") as client:
+            await client.get_or_regen(
+                "content:asset:1",
+                object_type="media",
+                ttl_ms=60_000,
+                regen=lambda: {"bytes": 1},
+            )
+
+    server.fake.admit = True
+    server.fake.puts.clear()
+    run(scenario())
+
+    context = server.fake.puts[-1]["context"]
+    assert context["depends_on"] == []
+    assert context["namespace"] is None

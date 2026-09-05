@@ -110,6 +110,11 @@ class AnalyticsService(AppService):
             regen=regen,
             sla_class=plan.query.sla_class,
             force_fresh=fresh,
+            # The rollup declares the rows and tables it was computed from, so a price
+            # change in Postgres reaches exactly the objects built from it. This is what
+            # makes the 10-minute TTL a backstop rather than the correctness mechanism.
+            depends_on=list(plan.tags),
+            namespace="analytics",
         )
         self.account(object_type=plan.query.object_type, outcome=outcome, key_id=key_id)
 

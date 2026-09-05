@@ -463,6 +463,8 @@ class AuraClient:
         encoding: Encoding = "json",
         force_fresh: bool = False,
         cost_hint: CostVector | None = None,
+        depends_on: list[str] | None = None,
+        namespace: str | None = None,
     ) -> Any:
         """Serve `key` from the cache, or regenerate it and report the real cost."""
         outcome = await self.get_or_regen_detailed(
@@ -474,6 +476,8 @@ class AuraClient:
             encoding=encoding,
             force_fresh=force_fresh,
             cost_hint=cost_hint,
+            depends_on=depends_on,
+            namespace=namespace,
         )
         return outcome.value
 
@@ -488,8 +492,15 @@ class AuraClient:
         encoding: Encoding = "json",
         force_fresh: bool = False,
         cost_hint: CostVector | None = None,
+        depends_on: list[str] | None = None,
+        namespace: str | None = None,
     ) -> RegenOutcome:
-        """`get_or_regen`, but returning the full accounting for the call."""
+        """`get_or_regen`, but returning the full accounting for the call.
+
+        `depends_on` is what makes a write in the database able to reach this object. The
+        tags travel with the admission, so a later `POST /v1/invalidate` naming any of them
+        removes exactly the objects built from that row -- and nothing else.
+        """
         started = time.perf_counter()
 
         if not force_fresh:
@@ -543,6 +554,8 @@ class AuraClient:
             ttl_ms=ttl_ms,
             sla_class=sla_class or self.default_sla,
             regen=cost,
+            depends_on=list(depends_on or ()),
+            namespace=namespace,
         )
         result = await self.put(key, value, context, encoding=encoding)
 

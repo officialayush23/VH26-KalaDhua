@@ -59,16 +59,34 @@ class RecommendationService(AppService):
             "aura_app_catalogue_users": float(self.catalogue.n_users),
         }
 
-    def cache_key(self, key_id: int | str) -> str:
-        """Personalised keys: one object per user and segment."""
+    def cache_key(self, key_id: int | str, epoch: int = 0) -> str:
+        """Personalised keys, versioned by the user's interaction epoch.
+
+        The epoch is invalidation by construction. When a user clicks, the caller advances
+        their epoch, which changes the key, so the ranking built before the click is never
+        requested again and ages out under ordinary pressure. Nothing has to be found and
+        deleted at the moment of the click -- which is the expensive, racy way to do this,
+        and the way that turns one click into a synchronous cache write.
+        """
         user_id = _user_id(key_id)
         segment = SEGMENTS[user_id % len(SEGMENTS)]
+        if epoch:
+            return f"{APPLICATION}:user:{user_id}:{segment}:e{epoch}"
         return f"{APPLICATION}:user:{user_id}:{segment}"
 
     async def produce(self, key_id: int | str, fresh: bool, options: dict[str, str] | None = None) -> dict[str, Any]:
         """Serve one ranking, through the cache."""
         user_id = _user_id(key_id)
-        key = self.cache_key(key_id)
+        epoch = _epoch(options)
+        key = self.cache_key(key_id, epoch)
+        # A small, deliberate slice of traffic never reads the cache.
+        #
+        # Two reasons, both of which matter more than the hit rate it costs. A recommender
+        # that only ever sees its own cached output stops receiving fresh impressions and
+        # the learner starves. And without a control group there is no way to measure what
+        # caching costs in recommendation *quality* -- only what it saves in dollars, which
+        # is the easy half of the question.
+        bypass = fresh or _is_control(user_id)
         work_factor = self.tail.factor(key_id)
         target_bytes = model.target_bytes_for(user_id)
         top_k, explain_dim = model.payload_dimensions(user_id, target_bytes)
@@ -93,7 +111,13 @@ class RecommendationService(AppService):
             ttl_ms=TTL_MS,
             regen=regen,
             sla_class="high",
-            force_fresh=fresh,
+            force_fresh=bypass,
+            # A ranking is downstream of the user it was built for and of the catalogue it
+            # ranked. A catalogue reprice invalidates every ranking; a single user's
+            # profile change invalidates only theirs.
+            depends_on=[f"row:user:{user_id}", "table:catalogue"],
+            # Retired as a generation when the model is redeployed, rather than flushed.
+            namespace=APPLICATION,
         )
         self.account(object_type=OBJECT_TYPE, outcome=outcome, key_id=key_id)
 
@@ -102,6 +126,8 @@ class RecommendationService(AppService):
             "application": APPLICATION,
             "object_type": OBJECT_TYPE,
             "served_from": outcome.served_from,
+            "epoch": epoch,
+            "control_group": bypass and not fresh,
             "expensive_tail": self.tail.contains(key_id),
             "size_bytes": outcome.size_bytes,
             "serve_ms": round(outcome.serve_ms, 3),
@@ -132,6 +158,24 @@ class RecommendationService(AppService):
 
 def _wants_value(options: dict[str, str] | None) -> bool:
     return str((options or {}).get("value", "")).lower() in {"1", "true", "yes", "on"}
+
+
+def _epoch(options: dict[str, str] | None) -> int:
+    """The caller's interaction epoch for this user, if it is tracking one."""
+    try:
+        return max(0, int((options or {}).get("epoch", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+# One user in forty bypasses the cache permanently. Chosen by user id rather than at random
+# per request, so the same users are always in the control group and the comparison is
+# between two stable populations rather than two samples of one.
+CONTROL_GROUP_MODULUS = 40
+
+
+def _is_control(user_id: int) -> bool:
+    return user_id % CONTROL_GROUP_MODULUS == 0
 
 
 def _user_id(key_id: int | str) -> int:
