@@ -660,6 +660,12 @@ fn build_frame(app: &Shared) -> Value {
             "expirations": eng.store.expirations,
             "inference_calls": eng.predictor.calls,
             "resident_objects": eng.store.len(),
+            // Memory the process holds that the pool size does not explain. A cache that
+            // reports only its pool is reporting the number least likely to be the one
+            // that kills it.
+            "tracked_keys": eng.features.tracked_keys(),
+            "tracked_keys_evicted": eng.keys_evicted,
+            "journal_pending": eng.journal_stats().pending,
             "used_bytes": eng.store.used_bytes(),
             "capacity_bytes": eng.store.capacity_bytes(),
             "decision_overhead_us_p50": round2(eng.overhead_p50())

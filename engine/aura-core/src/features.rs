@@ -165,6 +165,9 @@ impl FeatureBuilder {
         &self.pricing
     }
 
+    /// How many keys currently carry state. This is the one structure in the builder that
+    /// grows with the *total* key space rather than the working set, so it is the number to
+    /// watch when the process is using more memory than the pool explains.
     pub fn tracked_keys(&self) -> usize {
         self.keys.len()
     }
@@ -185,6 +188,24 @@ impl FeatureBuilder {
         let before = self.keys.len();
         self.keys.retain(|_, s| s.last_ts_ms >= cutoff_ms);
         before - self.keys.len()
+    }
+
+    /// Bound the per-key state by age first and by count second.
+    ///
+    /// Age alone is not enough. A workload that touches millions of distinct keys inside
+    /// one window — a scan, a working-set explosion — leaves every one of them "recent",
+    /// and the map grows until the allocator refuses. Since a binary built with
+    /// `panic = "abort"` does not survive that to explain itself, the ceiling is enforced
+    /// by halving the window until the map fits. Keys dropped this way are the least
+    /// recently seen, and their decayed counters had almost nothing left in them.
+    pub fn bound_keys(&mut self, now_ms: f64, max_age_ms: f64, max_keys: usize) -> usize {
+        let mut dropped = self.evict_stale(now_ms - max_age_ms);
+        let mut window = max_age_ms;
+        while self.keys.len() > max_keys && window > 1_000.0 {
+            window /= 2.0;
+            dropped += self.evict_stale(now_ms - window);
+        }
+        dropped
     }
 
     /// Build the feature vector for `event` and advance the builder's state.
@@ -422,6 +443,55 @@ impl PressureReplica {
         self.entries.insert(key, (size_bytes, now_ms, ttl_ms));
         self.order.push(key);
         self.used_bytes += size_bytes;
+    }
+}
+
+#[cfg(test)]
+mod bounding_tests {
+    use super::*;
+
+    fn touch(fb: &mut FeatureBuilder, key: KeyId, ts_ms: f64) {
+        let event = AccessEvent {
+            ts_ms,
+            key_id: key,
+            application: "app".to_string(),
+            object_type: "object".to_string(),
+            size_bytes: 1_000,
+            ttl_ms: 0.0,
+            regen: crate::types::CostVector { db_ms: 10.0, ..Default::default() },
+            regen_latency_ms: 10.0,
+        };
+        fb.transform(&event, AmbientState { cache_pressure: 0.0, ttl_remaining_frac: 1.0 });
+    }
+
+    #[test]
+    fn per_key_state_does_not_grow_without_bound() {
+        let mut fb = FeatureBuilder::new(FeatureConfig::default(), Pricing::default());
+        // A scan: every key distinct, all of them inside one window, so an age cutoff
+        // alone would keep every one of them.
+        for k in 0..5_000u64 {
+            touch(&mut fb, k, k as f64);
+        }
+        assert_eq!(fb.tracked_keys(), 5_000);
+
+        let dropped = fb.bound_keys(5_000.0, 3_600_000.0, 1_000);
+        assert!(dropped >= 4_000, "nothing was dropped: {dropped}");
+        assert!(
+            fb.tracked_keys() <= 1_000,
+            "the ceiling was not enforced: {} keys survived",
+            fb.tracked_keys()
+        );
+    }
+
+    #[test]
+    fn keys_still_in_the_working_set_survive_the_age_cutoff() {
+        let mut fb = FeatureBuilder::new(FeatureConfig::default(), Pricing::default());
+        touch(&mut fb, 1, 0.0);            // old
+        touch(&mut fb, 2, 7_200_000.0);    // recent
+        // One hour cutoff at t = 7,200,000 ms drops the key last seen at zero.
+        fb.bound_keys(7_200_000.0, 3_600_000.0, 500_000);
+        assert!(fb.key_state(2).is_some(), "a live key was evicted");
+        assert!(fb.key_state(1).is_none(), "a long-dead key was kept");
     }
 }
 

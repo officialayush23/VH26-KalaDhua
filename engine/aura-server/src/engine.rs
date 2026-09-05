@@ -19,6 +19,27 @@ use crate::predictor::Predictor;
 use crate::profiles::ProfileStore;
 use crate::store::{Entry, Store};
 
+/// Measured cost of one key's feature state: the struct itself plus its share of the hash
+/// map's overhead. Used to turn a byte budget into a key count.
+const BYTES_PER_TRACKED_KEY: u64 = 180;
+
+/// How much of the pool's own byte budget the per-key feature state is allowed to cost.
+///
+/// A fixed key ceiling is wrong because the same number means something different on a
+/// laptop and on a 512 MB container: 500,000 keys is 90 MB, which is a rounding error next
+/// to a 4 GB pool and a third of the whole instance next to a 64 MB one. Sizing it against
+/// the pool keeps the ratio sane on both.
+const TRACKED_KEY_BUDGET_FRACTION: u64 = 4;
+
+const MIN_TRACKED_KEYS: usize = 20_000;
+const MAX_TRACKED_KEYS: usize = 500_000;
+
+/// The key ceiling for a given pool size.
+fn tracked_key_ceiling(capacity_bytes: u64) -> usize {
+    let budget = capacity_bytes / TRACKED_KEY_BUDGET_FRACTION;
+    ((budget / BYTES_PER_TRACKED_KEY) as usize).clamp(MIN_TRACKED_KEYS, MAX_TRACKED_KEYS)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExplainRecord {
     pub t: f64,
@@ -282,6 +303,9 @@ pub struct Engine {
     /// that did *not* wait for a rebuild, and each one is also a small admission of
     /// staleness, so it is counted rather than hidden inside the hit rate.
     pub stale_serves: u64,
+    /// Per-key feature state dropped to keep the builder bounded. Reported, because a
+    /// number that only ever rises silently is how the last leak hid.
+    pub keys_evicted: u64,
     /// Objects whose rebuild is owed but not yet done. Draining this is what makes refresh
     /// real rather than a clock reset.
     pub refresh_queue: VecDeque<KeyId>,
@@ -351,6 +375,7 @@ impl Engine {
             refreshes: 0,
             rejections: 0,
             stale_serves: 0,
+            keys_evicted: 0,
             refresh_queue: VecDeque::with_capacity(256),
             decision_overhead_us: VecDeque::with_capacity(2_048),
             calib_kept: Calibration::default(),
@@ -1515,6 +1540,29 @@ impl Engine {
     /// Recomputed on the controller tick rather than per request. Every statistic here is
     /// derived from the last window only, so a regime change shows up within one window.
     pub fn recompute_workload(&mut self) {
+        // Bound the per-key feature state before anything else on this tick.
+        //
+        // `FeatureBuilder` keeps a KeyState for every key it has ever scored, and nothing
+        // was pruning it: the builder's own doc comment said the controller tick would, and
+        // no call site existed. At roughly 180 bytes a key including map overhead, a run
+        // that touches a few million distinct keys is a gigabyte of state the pool size
+        // does not account for -- and with `--real-values` the pool is already real memory,
+        // so the allocator refuses and the process aborts without a message. That is what
+        // was killing the engine a few seconds into a run and taking the telemetry socket
+        // with it.
+        //
+        // An hour is the longest frequency window, so a key unseen for longer than that has
+        // decayed to nothing and carries no information worth its bytes.
+        let horizon = self.cfg.features.freq_windows_ms[2].max(3_600_000.0);
+        // Against the *current* pool, not the configured one: the controller resizes at
+        // runtime, and a ceiling pinned to the starting size would be wrong within a minute
+        // of the first scale-up.
+        let ceiling = tracked_key_ceiling(self.store.capacity_bytes());
+        let dropped = self.features.bound_keys(self.now_ms, horizon, ceiling);
+        if dropped > 0 {
+            self.keys_evicted += dropped as u64;
+        }
+
         let n = self.recent_keys.len();
         if n < 64 {
             return;
@@ -1703,6 +1751,21 @@ mod tests {
         let c = ctx("analytics", 1_000, tags, ttl_ms);
         let (d, _) = e.put(key, Value::Null, &c, db_cost(40.0), at);
         assert_eq!(d.action, Action::Admit, "test setup failed to admit key {key}");
+    }
+
+    #[test]
+    fn the_key_ceiling_is_proportional_to_the_pool() {
+        // A 512 MB Render instance running a 64 MB pool must not be told it may keep
+        // 500,000 keys, which is 90 MB -- a third of the whole container.
+        let small = tracked_key_ceiling(64 * 1024 * 1024);
+        assert!(small <= 100_000, "64 MB pool was allowed {small} keys");
+        assert!(small >= MIN_TRACKED_KEYS);
+
+        // A large pool gets the absolute ceiling and no more.
+        assert_eq!(tracked_key_ceiling(8 * 1024 * 1024 * 1024), MAX_TRACKED_KEYS);
+
+        // And a tiny pool still gets enough state to be a cache rather than nothing.
+        assert_eq!(tracked_key_ceiling(1024), MIN_TRACKED_KEYS);
     }
 
     #[test]
