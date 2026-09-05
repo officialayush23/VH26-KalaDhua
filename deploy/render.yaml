@@ -40,7 +40,11 @@ services:
       # refuses to start in this mode rather than accepting everyone.
       - key: AURA_AUTH
         value: enforced
-      - key: SUPABASE_JWT_KEY
+      # The first account. Created on first boot, then persisted, so a recycled container
+      # does not lose the only way in.
+      - key: AURA_ROOT_EMAIL
+        sync: false
+      - key: AURA_ROOT_PASSWORD
         sync: false
       - key: SUPABASE_URL
         sync: false
@@ -57,10 +61,6 @@ services:
       # Baked into the bundle at build time, so changing one means a redeploy.
       - key: VITE_AURA_URL
         sync: false          # https://aura-engine-xxxx.onrender.com
-      - key: VITE_SUPABASE_URL
-        sync: false
-      - key: VITE_SUPABASE_ANON_KEY
-        sync: false
     routes:
       # Single-page app: every path falls through to the one HTML file, or a refresh on any
       # panel returns 404.
