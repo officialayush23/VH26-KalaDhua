@@ -220,23 +220,31 @@ pub enum Outcome {
     StaleMiss,
 }
 
-/// Which tier answered a request. Kept in the request record so the dashboard can draw
-/// the journey a request took through the universe.
+/// Which tier answered a request.
+///
+/// There are two, and naming them honestly matters more than the names being pretty.
+/// `AdmissionWindow` is a small recency set holding **keys only, no values** -- it exists to
+/// spot one-shot keys and it can never answer a request, so it is not a cache tier. `Cache`
+/// is the scored pool: the thing this project is about. `Backend` is the application going
+/// to its own origin.
+///
+/// A `Cdn` variant used to sit at the top of this list, with a `CdnConfig` beside it in the
+/// configuration, and neither was ever implemented. A tier that appears in the vocabulary,
+/// the config file and the dashboard but nowhere in the request path is not a roadmap item,
+/// it is a claim the code does not support -- so it is gone rather than pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Layer {
-    Cdn,
-    L1,
-    L2,
+    AdmissionWindow,
+    Cache,
     Backend,
 }
 
 impl Layer {
     pub fn as_str(self) -> &'static str {
         match self {
-            Layer::Cdn => "CDN",
-            Layer::L1 => "L1",
-            Layer::L2 => "L2",
-            Layer::Backend => "Backend",
+            Layer::AdmissionWindow => "admission window",
+            Layer::Cache => "cache",
+            Layer::Backend => "backend",
         }
     }
 }

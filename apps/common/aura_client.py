@@ -73,6 +73,27 @@ class PutResult:
     used_bytes: int = 0
 
 
+# What a cached "this does not exist" looks like on the wire.
+#
+# Negative caching is the edge case a value-scored cache is *most* likely to get wrong,
+# because a miss that produces nothing looks worthless by every measure the scorer has: no
+# bytes, no reuse history, and a rebuild cost that came back empty. Yet a key that does not
+# exist and is asked for constantly -- a deleted product still linked from somewhere, a
+# probing scanner, a bad client retrying -- is precisely the traffic that reaches the origin
+# every single time and costs the most in aggregate.
+#
+# So an absent value is cached deliberately, as a tiny object with a short lifetime. Short,
+# because the cost of being wrong is asymmetric: holding a stale "exists" serves bad data,
+# while holding a stale "missing" only serves an unnecessary 404 for a few seconds.
+_ABSENT_MARKER = "__aura_absent__"
+NEGATIVE_TTL_MS = 30_000
+
+
+def is_absent(value: Any) -> bool:
+    """True when the cache is holding a remembered absence rather than a value."""
+    return isinstance(value, dict) and value.get(_ABSENT_MARKER) is True
+
+
 @dataclass
 class RegenOutcome:
     """What a `get_or_regen` call did, for callers that need the detail."""
@@ -86,6 +107,9 @@ class RegenOutcome:
     reason_code: str
     served_from: Literal["cache", "origin"]
     serve_ms: float
+    # The object genuinely does not exist, and the cache is remembering that rather than
+    # asking the origin again. Callers turn this into their own 404.
+    absent: bool = False
 
 
 def _headers(application: str, api_key: str | None) -> dict[str, str]:
@@ -211,6 +235,10 @@ class AuraClient:
             "regens": 0,
             "cache_errors": 0,
             "breaker_skips": 0,
+            # Origin calls avoided for keys that do not exist. Counted separately from
+            # ordinary hits because they are the ones a value-scored cache is most likely
+            # to have thrown away.
+            "negative_hits": 0,
             "saved_usd": 0.0,
             "spent_usd": 0.0,
             "get_latency_ms_total": 0.0,
@@ -600,6 +628,23 @@ class AuraClient:
             if entry is not None:
                 saved, size_bytes = self._recall_cost(key)
                 self._counters["saved_usd"] += saved
+                if is_absent(entry.value):
+                    # A remembered absence still saved an origin call, which is the whole
+                    # point of storing it, so it counts as a hit and reports the cost it
+                    # avoided. What it must not do is hand the caller the marker.
+                    self._counters["negative_hits"] += 1
+                    return RegenOutcome(
+                        value=None,
+                        hit=True,
+                        cost=CostVector(),
+                        cost_usd=saved,
+                        size_bytes=size_bytes,
+                        admitted=None,
+                        reason_code="negative_hit",
+                        served_from="cache",
+                        serve_ms=(time.perf_counter() - started) * 1000.0,
+                        absent=True,
+                    )
                 return RegenOutcome(
                     value=entry.value,
                     hit=True,
@@ -635,25 +680,38 @@ class AuraClient:
         cost.network_bytes = max(cost.network_bytes, size_bytes)
 
         cost_usd = cost.usd(self.pricing)
+        if value is None:
+            # Charged for what it actually occupies. Reporting the size of the thing that
+            # was not there would make the cache price a few bytes as though they were a
+            # megabyte, and refuse to keep them.
+            size_bytes = 64
         self._counters["regens"] += 1
         self._counters["spent_usd"] += cost_usd
         self._remember_cost(key, cost, cost_usd, size_bytes)
+
+        # The origin says this does not exist. Remember that rather than asking again on
+        # every request: a key that is absent and popular is the traffic that reaches the
+        # origin one hundred percent of the time.
+        absent = value is None
+        stored: Any = {_ABSENT_MARKER: True} if absent else value
+        effective_ttl = min(ttl_ms, NEGATIVE_TTL_MS) if absent else ttl_ms
 
         context = ObjectContext(
             application=self.application,
             object_type=object_type,
             size_bytes=size_bytes,
-            ttl_ms=ttl_ms,
+            ttl_ms=effective_ttl,
             sla_class=sla_class or self.default_sla,
             regen=cost,
             depends_on=list(depends_on or ()),
             namespace=namespace,
         )
-        result = await self.put(key, value, context, encoding=encoding)
+        result = await self.put(key, stored, context, encoding=encoding)
 
         return RegenOutcome(
             value=value,
             hit=False,
+            absent=absent,
             cost=cost,
             cost_usd=cost_usd,
             size_bytes=size_bytes,

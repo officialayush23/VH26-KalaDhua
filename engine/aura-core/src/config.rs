@@ -116,20 +116,6 @@ impl Default for CacheConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CdnConfig {
-    pub enabled: bool,
-    pub ttl_ms: f64,
-    pub capacity_bytes: u64,
-}
-
-impl Default for CdnConfig {
-    fn default() -> Self {
-        Self { enabled: true, ttl_ms: 60_000.0, capacity_bytes: 128 * 1024 * 1024 }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct EngineConfig {
     /// How many victims to sample when the cache is under pressure. The model only ever
     /// scores this many objects, which is what keeps inference off the hot path.
@@ -267,7 +253,6 @@ impl Default for GhostConfig {
 #[serde(default)]
 pub struct Config {
     pub cache: CacheConfig,
-    pub cdn: CdnConfig,
     pub pricing: Pricing,
     pub features: FeatureConfig,
     pub engine: EngineConfig,
@@ -309,7 +294,6 @@ impl Config {
             self.cache.l1.capacity_bytes = v;
         }
         if let Some(v) = bool_var("AURA__CDN__ENABLED") {
-            self.cdn.enabled = v;
         }
         if let Some(v) = bool_var("AURA__CAPACITY__AUTO") {
             self.capacity.auto = v;

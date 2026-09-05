@@ -10,11 +10,6 @@ shards = 16
 [cache.l1]
 capacity_bytes = 33554432
 
-[cdn]
-enabled = true
-ttl_ms = 60000.0
-capacity_bytes = 134217728
-
 # USD price table. Mirrored in training/aura_train/config.py; regen_cost_usd is a model
 # feature, so these two must stay numerically identical.
 [pricing]

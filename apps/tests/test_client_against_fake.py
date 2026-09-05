@@ -408,3 +408,57 @@ def test_an_object_without_declared_dependencies_still_admits(server: Any) -> No
     context = server.fake.puts[-1]["context"]
     assert context["depends_on"] == []
     assert context["namespace"] is None
+
+
+# ------------------------------------------------------------------- negative caching
+
+
+def test_an_absent_object_is_remembered_rather_than_asked_for_again(server: Any) -> None:
+    """A key that does not exist must not reach the origin on every request.
+
+    This is the edge case a value-scored cache is most likely to get wrong. An absence has
+    no bytes, no reuse history and an empty rebuild, so every signal the scorer has says it
+    is worthless -- yet a popular missing key is the traffic that reaches the origin one
+    hundred percent of the time.
+    """
+
+    async def scenario() -> None:
+        calls = {"n": 0}
+
+        async def regen(meter: CostMeter) -> Any:
+            calls["n"] += 1
+            meter.add_db_ms(40.0)
+            return None  # the origin says: no such thing
+
+        async with AuraClient(server.base_url, application="analytics") as client:
+            first = await client.get_or_regen_detailed(
+                "analytics:missing:1", object_type="dashboard_query",
+                ttl_ms=600_000, regen=regen,
+            )
+            assert first.absent is True
+            assert first.value is None
+            assert first.served_from == "origin"
+            assert calls["n"] == 1
+
+            second = await client.get_or_regen_detailed(
+                "analytics:missing:1", object_type="dashboard_query",
+                ttl_ms=600_000, regen=regen,
+            )
+            assert second.absent is True
+            assert second.value is None, "the caller must never see the internal marker"
+            assert second.hit is True
+            assert second.reason_code == "negative_hit"
+            assert calls["n"] == 1, "the origin was asked a second time for a known absence"
+            assert client.stats()["negative_hits"] == 1
+
+    server.fake.admit = True
+    server.fake.puts.clear()
+    run(scenario())
+
+    context = server.fake.puts[-1]["context"]
+    assert context["size_bytes"] < 1024, "an absence must be charged as the few bytes it is"
+    assert context["ttl_ms"] <= 30_000, (
+        "a remembered absence must expire quickly: serving a stale 'missing' costs one "
+        "unnecessary 404, but holding it as long as a real object would hide a key that "
+        "has since been created"
+    )
