@@ -391,6 +391,17 @@ class AppService:
 
     # ------------------------------------------------------------ accounting
 
+    def typical_regen_ms(self, object_type: str | None = None) -> float:
+        """Median observed rebuild time, in milliseconds.
+
+        Used to say what a cache hit saved in *waiting*, not just in money. It is the median
+        of what this process has actually measured rather than a configured estimate, so on
+        a cold start it is zero and the page shows nothing rather than a number nobody
+        earned.
+        """
+        _ = object_type  # one distribution per service today; the argument keeps the door open
+        return float(self.telemetry.regen_ms.quantile(0.50))
+
     def account(
         self,
         *,

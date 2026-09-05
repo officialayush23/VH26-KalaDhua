@@ -43,6 +43,8 @@ class AppTarget:
     key_space: int
     share: float
     concurrency: int = 12
+    errors: int = 0
+    first_error: str = ""
     process: subprocess.Popen[bytes] | None = None
     generator: KeyGenerator | None = field(default=None, repr=False)
 
@@ -146,8 +148,13 @@ async def drive_target(
         async with semaphore:
             try:
                 await client.get(f"{target.base_url}/work/{key_id}", timeout=30.0)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Counted and remembered rather than swallowed. A load generator that hides
+                # its own failures reports a flat table and lets you conclude the cache is
+                # doing nothing, when in fact nothing was ever asked of it.
+                target.errors += 1
+                if not target.first_error:
+                    target.first_error = f"{type(exc).__name__}: {exc}"[:160]
 
     while not stop.is_set() and time.perf_counter() - started < duration_s:
         due = started + issued * interval
@@ -156,7 +163,12 @@ async def drive_target(
             try:
                 await asyncio.wait_for(stop.wait(), timeout=due - now)
                 break
-            except TimeoutError:
+            # asyncio.TimeoutError only became an alias of the built-in TimeoutError in
+            # Python 3.11. On 3.10 the bare `except TimeoutError` here caught nothing, the
+            # exception escaped a task nobody awaited, and this loop died after issuing
+            # exactly one request -- which is why the table showed reqs=1 for the whole run
+            # and never moved.
+            except (asyncio.TimeoutError, TimeoutError):
                 pass
         task = asyncio.create_task(one(generator.next_key()))
         inflight.add(task)
@@ -187,7 +199,9 @@ def render(rows: list[tuple[AppTarget, dict[str, Any]]], elapsed: float) -> str:
     lines = [f"t={elapsed:6.1f}s", header, "-" * len(header)]
     total_spent = 0.0
     total_saved = 0.0
+    total_errors = 0
     for target, stats in rows:
+        total_errors += target.errors
         if not stats:
             lines.append(f"{target.name:<16}{'(unreachable)':>73}")
             continue
@@ -210,6 +224,11 @@ def render(rows: list[tuple[AppTarget, dict[str, Any]]], elapsed: float) -> str:
         )
     lines.append("-" * len(header))
     lines.append(f"{'total':<16}{'':>8}{'':>7}{'':>8}{'':>8}{'':>9}{'':>9}{total_spent:>11.6f}{total_saved:>11.6f}")
+    if total_errors:
+        # Said plainly. A table of zeroes with a silent failure count underneath it reads as
+        # "the cache did nothing", when the truth is that nothing ever reached the cache.
+        detail = next((t.first_error for t, _ in rows if t.first_error), "")
+        lines.append(f"{total_errors} request(s) failed. First: {detail}")
     return "\n".join(lines)
 
 

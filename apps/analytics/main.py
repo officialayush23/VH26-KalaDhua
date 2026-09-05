@@ -30,6 +30,7 @@ from analytics import queries
 from analytics.db import Backend, open_backend
 from common.costing import CostMeter, CostVector
 from common.service import AppService, build_app, configure_logging
+from common.storefront import analytics_page, storefront_route
 from common.settings import get_settings
 
 APPLICATION = "analytics"
@@ -131,6 +132,7 @@ class AnalyticsService(AppService):
             "serve_ms": round(outcome.serve_ms, 3),
             "regen": outcome.cost.model_dump(),
             "regen_cost_usd": round(outcome.cost_usd, 8),
+            "regen_ms_if_missed": round(self.typical_regen_ms(plan.query.object_type), 2),
             "admitted": outcome.admitted,
             "reason_code": outcome.reason_code,
             "row_count": value.get("row_count", 0),
@@ -224,9 +226,27 @@ def create_app():  # noqa: ANN201 - Starlette application factory
             status_code=200 if db_ok else 503,
         )
 
+    async def invalidate(request: Request) -> JSONResponse:
+        """Stand in for the database trigger, from a button.
+
+        The real path is a Postgres trigger emitting `pg_notify` and the listener forwarding
+        it. This is the same POST that listener makes, so the demo exercises the engine's
+        actual invalidation path rather than a special case built for the demo.
+        """
+        body = await request.json()
+        tags = [str(t) for t in (body.get("tags") or []) if str(t).strip()]
+        if not tags:
+            return JSONResponse({"error": "no tags given"}, status_code=400)
+        result = await service.client.invalidate(
+            tags, mode=str(body.get("mode", "hard")), source="dashboard"
+        )
+        return JSONResponse(result or {"error": "the cache did not answer"})
+
     routes = [
+        Route("/", storefront_route(analytics_page, regions=queries.REGION_COUNT), methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/profile", profile, methods=["GET"]),
+        Route("/invalidate", invalidate, methods=["POST"]),
         Route("/sql/{key_id}", explain_sql, methods=["GET"]),
     ]
     return build_app(service, routes)

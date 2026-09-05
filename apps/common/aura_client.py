@@ -363,6 +363,42 @@ class AuraClient:
         except ValueError:
             return False
 
+    async def invalidate(
+        self, tags: list[str], *, mode: str = "hard", source: str = "application"
+    ) -> dict[str, Any] | None:
+        """`POST /v1/invalidate` -- drop every object built from these tags.
+
+        The application side of dependency invalidation. `hard` removes immediately, which
+        is what a price or a permission needs; `soft` marks stale so the next reader gets
+        the old value once while a rebuild runs behind them, which is far cheaper than a
+        stampede for a derived rollup.
+
+        Returns `None` rather than raising when the cache cannot be reached. A failed
+        invalidation is serious -- it means stale objects survive -- so it is reported to the
+        caller instead of being swallowed, but it must not take the application down with
+        it: the TTL is still there as a backstop.
+        """
+        if not tags:
+            return {"matched": 0, "keys_hard": 0, "keys_soft": 0}
+        if not self._breaker.allow():
+            self._counters["breaker_skips"] += 1
+            return None
+        try:
+            response = await self._http.post(
+                "/v1/invalidate", json={"tags": tags, "mode": mode, "source": source}
+            )
+        except Exception as exc:
+            self._note_cache_failure("invalidate", exc)
+            return None
+        self._note_cache_success()
+        if response.status_code != 200:
+            log.warning("invalidate refused: %s %s", response.status_code, response.text[:200])
+            return None
+        try:
+            return dict(response.json())
+        except ValueError:
+            return None
+
     async def refresh(self, key: str) -> bool:
         """`POST /v1/cache/{key}/refresh` - ask the engine to re-warm a key."""
         if not self._breaker.allow():

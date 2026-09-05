@@ -28,6 +28,7 @@ from starlette.routing import Route
 
 from common.costing import CostMeter, CostVector
 from common.service import AppService, build_app, configure_logging
+from common.storefront import recommendation_page, storefront_route
 from common.settings import get_settings
 from recommendation import data, model
 
@@ -133,6 +134,10 @@ class RecommendationService(AppService):
             "serve_ms": round(outcome.serve_ms, 3),
             "regen": outcome.cost.model_dump(),
             "regen_cost_usd": round(outcome.cost_usd, 8),
+            # What a miss on this key costs in wall-clock time. The page subtracts the time
+            # the hit actually took to show waiting avoided; without it the UI would have to
+            # guess, and a guessed saving is not a saving.
+            "regen_ms_if_missed": round(self.typical_regen_ms(OBJECT_TYPE), 2),
             "admitted": outcome.admitted,
             "reason_code": outcome.reason_code,
         }
@@ -208,7 +213,13 @@ def create_app():  # noqa: ANN201 - Starlette application factory
             }
         )
 
-    return build_app(service, [Route("/profile", profile, methods=["GET"])])
+    return build_app(
+        service,
+        [
+            Route("/", storefront_route(recommendation_page, users=data.N_USERS), methods=["GET"]),
+            Route("/profile", profile, methods=["GET"]),
+        ],
+    )
 
 
 app = create_app()
